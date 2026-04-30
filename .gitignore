@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+captcha.png
+cookies.json
+login_result.html
+course_snapshot*.json
+
+# Local mirrored/private ArchersHub artifacts
+mirror/browser_profile/
+mirror/mirror/
+mirror/*.zip
+mirror/captcha.png
+mirror/cookies.json
+mirror/login_result.html
