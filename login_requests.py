@@ -1087,7 +1087,7 @@ def submit_change_section(session: requests.Session, args: argparse.Namespace, p
 
 def submit_add_drop(session: requests.Session, args: argparse.Namespace, payload: dict[str, Any]) -> Any:
     response = post_json(session, args.base_url, "/ApplyAddDrop/SaveEnlistmentData/", payload)
-    if str(response).strip() != "1":
+    if str(response).strip() not in {"0", "1"}:
         raise RuntimeError(f"add/drop submit was not accepted: {response!r}")
     return response
 
@@ -1295,6 +1295,22 @@ def maybe_submit_drop_add_switch(
                 return False
 
             log("target section is still open and switch is not reflected yet; retrying submit")
+        except Exception as exc:
+            log(
+                "drop/add submit returned an error response "
+                f"({exc}); waiting 10 seconds before verifying server state"
+            )
+            time.sleep(10)
+            try:
+                if drop_add_switch_reflected(session, args, target):
+                    log(
+                        "drop/add switch is reflected despite the error response; "
+                        f"{target['course_code']} is now in {args.target_section}"
+                    )
+                    return True
+            except Exception as verify_exc:
+                log(f"could not verify post-error state: {verify_exc}")
+            raise
 
 
 def persist_snapshot(snapshot: str, snapshot_file: str | None) -> None:
