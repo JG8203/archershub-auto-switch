@@ -4,6 +4,11 @@ import login_requests as lr
 
 
 class AutoSwitchHelperTests(unittest.TestCase):
+    def test_sanitize_captcha_text(self):
+        self.assertEqual(lr.sanitize_captcha_text(" ahm-vbm\n"), "AHMVBM")
+        self.assertTrue(lr.looks_like_captcha("AHMVBM"))
+        self.assertFalse(lr.looks_like_captcha("AHMVB"))
+
     def test_section_open_uses_updated_capacity_when_present(self):
         section = {"capacity": 45, "updated_capacity": 50, "enlisted": 45}
         self.assertEqual(lr.effective_capacity(section), 50)

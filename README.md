@@ -22,6 +22,23 @@ python login_requests.py \
 ```
 
 The default auto-switch strategy is `drop-add`. The script still requires manual captcha entry at login.
+By default it tries to solve the captcha with Tesseract OCR first, then falls back to manual entry if OCR fails.
+
+Install the Tesseract binary if it is not already available:
+
+```bash
+# macOS
+brew install tesseract
+
+# Termux / Android
+pkg install tesseract
+```
+
+To force manual captcha entry:
+
+```bash
+--no-captcha-ocr
+```
 
 Optional reason IDs for Add/Drop, if required by ArchersHub:
 

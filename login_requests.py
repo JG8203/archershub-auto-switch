@@ -4,6 +4,8 @@ import argparse
 import base64
 import getpass
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -28,6 +30,8 @@ DEFAULT_MAX_LOGIN_ATTEMPTS = 5
 CHANGE_SECTION_TYPE_ID = "2"
 SWITCH_STRATEGY_CHANGE_SECTION = "change-section"
 SWITCH_STRATEGY_DROP_ADD = "drop-add"
+CAPTCHA_LENGTH = 6
+CAPTCHA_RE = re.compile(r"^[A-Z0-9]{6}$")
 
 
 class AutoSwitchSubmitError(RuntimeError):
@@ -88,6 +92,59 @@ def open_file(path: str) -> None:
         pass
 
 
+def sanitize_captcha_text(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
+def looks_like_captcha(value: str) -> bool:
+    return bool(CAPTCHA_RE.fullmatch(value))
+
+
+def solve_captcha_with_tesseract(path: Path) -> str | None:
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+        import pytesseract
+    except ImportError as exc:
+        log(f"captcha OCR unavailable; install pillow and pytesseract: {exc}")
+        return None
+
+    try:
+        image = Image.open(path)
+        image = ImageOps.grayscale(image)
+        image = image.resize((image.width * 3, image.height * 3))
+        image = image.filter(ImageFilter.MedianFilter(size=3))
+        image = image.point(lambda pixel: 255 if pixel > 150 else 0)
+
+        config = (
+            "--psm 8 --oem 3 "
+            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        )
+        text = pytesseract.image_to_string(image, config=config)
+        captcha = sanitize_captcha_text(text)
+        if looks_like_captcha(captcha):
+            return captcha
+
+        log(f"captcha OCR returned invalid text {captcha!r}; falling back to manual entry")
+    except Exception as exc:
+        log(f"captcha OCR failed: {exc}; falling back to manual entry")
+    return None
+
+
+def read_captcha(path: Path, *, use_ocr: bool = True) -> str:
+    if use_ocr:
+        captcha = solve_captcha_with_tesseract(path)
+        if captcha:
+            print(f"Captcha OCR: {captcha}")
+            return captcha
+
+    open_file(str(path))
+    while True:
+        captcha = sanitize_captcha_text(input("Captcha: "))
+        if looks_like_captcha(captcha):
+            return captcha
+        print(f"Captcha should be {CAPTCHA_LENGTH} letters/digits. Try again.")
+
+
 def get_login_form(html: str, page_url: str):
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form", id="LoginForm") or soup.find("form")
@@ -129,6 +186,7 @@ def login_once(
     password: str,
     *,
     save_artifacts: bool = True,
+    captcha_ocr: bool = True,
 ) -> requests.Session:
     session = create_session()
     base = base_url.rstrip("/") + "/"
@@ -146,8 +204,7 @@ def login_once(
     captcha_path = Path("captcha.png")
     captcha_path.write_bytes(captcha_response.content)
     print(f"Captcha saved to: {captcha_path}")
-    open_file(str(captcha_path))
-    captcha = input("Captcha: ").strip().upper()
+    captcha = read_captcha(captcha_path, use_ocr=captcha_ocr)
 
     cfg_response = session.post(
         urljoin(base, "StudentLogin/GetLoginConfigurationDetails/"),
@@ -251,7 +308,13 @@ def login_with_retry(args: argparse.Namespace, password: str) -> requests.Sessio
     for attempt in range(1, args.max_login_attempts + 1):
         log(f"login attempt {attempt}/{args.max_login_attempts}")
         try:
-            session = login_once(args.base_url, args.login_path, args.username, password)
+            session = login_once(
+                args.base_url,
+                args.login_path,
+                args.username,
+                password,
+                captcha_ocr=not args.no_captcha_ocr,
+            )
             log("login succeeded")
             return session
         except Exception as exc:
@@ -1351,6 +1414,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--login-path", default=DEFAULT_LOGIN_PATH)
     parser.add_argument("--username")
     parser.add_argument("--password")
+    parser.add_argument("--no-captcha-ocr", action="store_true", help="Disable Tesseract OCR and always ask for captcha manually.")
     parser.add_argument("--course-code", help="Enable course-watch mode for this course code.")
     parser.add_argument("--auto-switch-section", action="store_true", help="Automatically change to --target-section when it opens.")
     parser.add_argument(
@@ -1391,7 +1455,13 @@ def main() -> None:
     else:
         if args.auto_switch_section:
             raise RuntimeError("--course-code is required with --auto-switch-section")
-        login_once(args.base_url, args.login_path, args.username, password)
+        login_once(
+            args.base_url,
+            args.login_path,
+            args.username,
+            password,
+            captcha_ocr=not args.no_captcha_ocr,
+        )
 
 
 if __name__ == "__main__":
