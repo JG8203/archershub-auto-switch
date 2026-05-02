@@ -99,11 +99,6 @@ class WatchScheduler:
                 errors.append(message)
                 self._record_backoff(job, str(exc))
 
-        self.storage.set_scheduler_status(
-            last_error="; ".join(errors) if errors else "",
-            checked_jobs=checked,
-            notifications_sent=sent,
-        )
         return SchedulerCycleResult(checked, sent, errors)
 
     def _user_for_job(self, job: JobRecord):

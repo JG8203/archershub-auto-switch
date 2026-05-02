@@ -134,8 +134,7 @@ class SQLiteStorage:
             conn.close()
 
     def migrate(self) -> None:
-        with sqlite3.connect(self.path) as conn:
-            conn.execute("PRAGMA foreign_keys = ON")
+        with self.connect() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -586,11 +585,6 @@ class SQLiteStorage:
                 (user_id, error, now),
             )
 
-    def get_scheduler_status(self) -> dict[str, str | None]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT key, value FROM scheduler_state").fetchall()
-        return {str(row["key"]): str(row["value"]) for row in rows}
-
     def get_interval_secs(self) -> int:
         with self.connect() as conn:
             row = conn.execute("SELECT value FROM scheduler_state WHERE key = 'interval_secs'").fetchone()
@@ -607,47 +601,6 @@ class SQLiteStorage:
                 """,
                 (str(value), dt_to_text(utcnow())),
             )
-
-    def set_scheduler_status(
-        self,
-        *,
-        last_error: str | None = None,
-        checked_jobs: int | None = None,
-        notifications_sent: int | None = None,
-    ) -> None:
-        now = dt_to_text(utcnow())
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO scheduler_state(key, value, updated_at) VALUES('last_run_at', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (now, now),
-            )
-            if last_error is not None:
-                conn.execute(
-                    """
-                    INSERT INTO scheduler_state(key, value, updated_at) VALUES('last_error', ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                    """,
-                    (last_error, now),
-                )
-            if checked_jobs is not None:
-                conn.execute(
-                    """
-                    INSERT INTO scheduler_state(key, value, updated_at) VALUES('last_checked_jobs', ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                    """,
-                    (str(checked_jobs), now),
-                )
-            if notifications_sent is not None:
-                conn.execute(
-                    """
-                    INSERT INTO scheduler_state(key, value, updated_at) VALUES('last_notifications_sent', ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                    """,
-                    (str(notifications_sent), now),
-                )
 
     @staticmethod
     def _user_from_row(row: sqlite3.Row) -> UserRecord:

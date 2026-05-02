@@ -17,6 +17,7 @@ from .constants import (
     SWITCH_STRATEGY_CHANGE_SECTION,
     SWITCH_STRATEGY_DROP_ADD,
 )
+from .env import load_project_env
 from .sections import (
     available_slots,
     effective_capacity,
@@ -208,6 +209,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    load_project_env()
     args = parse_args()
     args.base_url = args.base_url.rstrip("/")
     args.username = args.username or input("Username / Email: ").strip()

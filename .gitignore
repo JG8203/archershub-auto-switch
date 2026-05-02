@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.env
+.env.*
 
 captcha.png
 cookies.json

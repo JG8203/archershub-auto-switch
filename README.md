@@ -109,26 +109,44 @@ This repository now includes the first implementation pieces for a trusted small
 
 ### Configuration
 
-```bash
-export BOT_TOKEN='123:telegram-token'
-export TELEGRAM_WEBHOOK_SECRET='optional-secret-sent-by-telegram'
-export ARCHERSHUB_MASTER_KEY='long-random-deployment-secret'
-export ARCHERSHUB_DB='data/archershub_bot.sqlite3'
+Create a local `.env` file:
+
+```env
+BOT_TOKEN=123:telegram-token
+ARCHERSHUB_MASTER_KEY=long-random-deployment-secret
+ARCHERSHUB_DB=data/archershub_bot.sqlite3
 ```
 
-Run the webhook app with Uvicorn:
+Run the polling bot:
 
 ```bash
-poetry run uvicorn archershub.bot.app:app --host 0.0.0.0 --port 8000
+poetry run archershub-bot
 ```
 
-Health check:
+The bot uses Telegram long polling, so a Raspberry Pi only needs outbound internet access. No webhook URL, public domain, Tailscale Funnel, Cloudflare Tunnel, or open router port is required.
 
-```bash
-curl http://localhost:8000/healthz
+If this bot previously had a webhook configured, startup clears it automatically before polling. To discard old queued Telegram updates on startup, add:
+
+```env
+TELEGRAM_DROP_PENDING_UPDATES=1
 ```
 
-Configure Telegram to post updates to `/telegram/webhook` and pass the same secret token if `TELEGRAM_WEBHOOK_SECRET` is set.
+Minimal systemd service for a Raspberry Pi:
+
+```ini
+[Unit]
+Description=ArchersHub Telegram bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/pi/archershub-endpoint
+ExecStart=/usr/bin/env poetry run archershub-bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ### Admin CLI
 
@@ -137,7 +155,6 @@ poetry run archershub-admin init-db
 poetry run archershub-admin generate-code --ttl-hours 24
 poetry run archershub-admin list-users
 poetry run archershub-admin list-jobs
-poetry run archershub-admin health
 poetry run archershub-admin list-failures
 poetry run archershub-admin list-captcha-users
 poetry run archershub-admin list-login-errors
@@ -180,7 +197,6 @@ Captcha behavior:
 Scheduler behavior:
 
 - Failed jobs use exponential backoff before the next automatic retry.
-- `/healthz` includes scheduler counts, paused/completed job totals, pending confirmations, and users currently blocked on captcha.
 
 Migration path:
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from .env import load_project_env
 from .storage import SQLiteStorage
 
 
@@ -11,6 +12,7 @@ def storage_from_args(args) -> SQLiteStorage:
 
 
 def main() -> None:
+    load_project_env()
     parser = argparse.ArgumentParser(description="Admin CLI for ArchersHub Telegram service")
     parser.add_argument("--db", help="SQLite database path")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -20,7 +22,6 @@ def main() -> None:
 
     sub.add_parser("list-users")
     sub.add_parser("list-jobs")
-    sub.add_parser("health")
     sub.add_parser("list-failures")
     sub.add_parser("list-captcha-users")
     sub.add_parser("list-login-errors")
@@ -44,22 +45,6 @@ def main() -> None:
                 f"{job.id}\tuser={job.user_id}\t{job.job_type}\tmode={job.mode}\t{job.course_code}\t"
                 f"enabled={job.enabled}\tpaused={paused}\tcompleted={job.completed_at or '-'}"
             )
-    elif args.command == "health":
-        status = storage.get_scheduler_status()
-        jobs = storage.list_jobs()
-        failing = [row for row in storage.list_job_runtime() if row.failure_count > 0]
-        captcha_users = [row for row in storage.list_user_runtime() if row.needs_captcha]
-        print(f"interval_secs={storage.get_interval_secs()}")
-        for key in sorted(status):
-            print(f"{key}={status[key]}")
-        print(f"jobs_total={len(jobs)}")
-        print(f"jobs_active={sum(1 for job in jobs if job.enabled and job.completed_at is None and job.paused_at is None)}")
-        print(f"jobs_paused={sum(1 for job in jobs if job.paused_at)}")
-        print(f"jobs_completed={sum(1 for job in jobs if job.completed_at)}")
-        print(f"jobs_failing={len(failing)}")
-        print(f"pending_confirmations={len(storage.list_pending_actions())}")
-        print(f"users_needing_captcha={len(captcha_users)}")
-        print(f"users_with_login_errors={sum(1 for row in storage.list_user_runtime() if row.last_login_error)}")
     elif args.command == "list-failures":
         for row in storage.list_job_runtime():
             if row.failure_count > 0:
