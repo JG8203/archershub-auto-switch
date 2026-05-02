@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import argparse
+import os
+
+from .storage import SQLiteStorage
+
+
+def storage_from_args(args) -> SQLiteStorage:
+    return SQLiteStorage(args.db or os.getenv("ARCHERSHUB_DB", "archershub_bot.sqlite3"))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Admin CLI for ArchersHub Telegram service")
+    parser.add_argument("--db", help="SQLite database path")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    gen = sub.add_parser("generate-code", help="Generate a one-time registration code")
+    gen.add_argument("--ttl-hours", type=int, default=24)
+
+    sub.add_parser("list-users")
+    sub.add_parser("list-jobs")
+    sub.add_parser("health")
+    sub.add_parser("list-failures")
+    sub.add_parser("list-captcha-users")
+    sub.add_parser("list-login-errors")
+    sub.add_parser("list-pending")
+    interval = sub.add_parser("set-interval")
+    interval.add_argument("seconds", type=int)
+    sub.add_parser("init-db")
+
+    args = parser.parse_args()
+    storage = storage_from_args(args)
+
+    if args.command == "generate-code":
+        print(storage.generate_registration_code(ttl_hours=args.ttl_hours))
+    elif args.command == "list-users":
+        for user in storage.list_users():
+            print(f"{user.id}\ttelegram={user.telegram_id}\t@{user.username or '-'}\tactive={user.is_active}")
+    elif args.command == "list-jobs":
+        for job in storage.list_jobs():
+            paused = job.paused_at or "-"
+            print(
+                f"{job.id}\tuser={job.user_id}\t{job.job_type}\tmode={job.mode}\t{job.course_code}\t"
+                f"enabled={job.enabled}\tpaused={paused}\tcompleted={job.completed_at or '-'}"
+            )
+    elif args.command == "health":
+        status = storage.get_scheduler_status()
+        jobs = storage.list_jobs()
+        failing = [row for row in storage.list_job_runtime() if row.failure_count > 0]
+        captcha_users = [row for row in storage.list_user_runtime() if row.needs_captcha]
+        print(f"interval_secs={storage.get_interval_secs()}")
+        for key in sorted(status):
+            print(f"{key}={status[key]}")
+        print(f"jobs_total={len(jobs)}")
+        print(f"jobs_active={sum(1 for job in jobs if job.enabled and job.completed_at is None and job.paused_at is None)}")
+        print(f"jobs_paused={sum(1 for job in jobs if job.paused_at)}")
+        print(f"jobs_completed={sum(1 for job in jobs if job.completed_at)}")
+        print(f"jobs_failing={len(failing)}")
+        print(f"pending_confirmations={len(storage.list_pending_actions())}")
+        print(f"users_needing_captcha={len(captcha_users)}")
+        print(f"users_with_login_errors={sum(1 for row in storage.list_user_runtime() if row.last_login_error)}")
+    elif args.command == "list-failures":
+        for row in storage.list_job_runtime():
+            if row.failure_count > 0:
+                print(
+                    f"job={row.job_id}\tfailures={row.failure_count}\t"
+                    f"next_retry_at={row.next_retry_at or '-'}\tlast_error={row.last_error or '-'}"
+                )
+    elif args.command == "list-captcha-users":
+        for row in storage.list_user_runtime():
+            if row.needs_captcha:
+                print(
+                    f"user={row.user_id}\tlast_captcha_at={row.last_captcha_at or '-'}\t"
+                    f"note={row.last_captcha_note or '-'}"
+                )
+    elif args.command == "list-login-errors":
+        for row in storage.list_user_runtime():
+            if row.last_login_error:
+                print(
+                    f"user={row.user_id}\tlast_login_error_at={row.last_login_error_at or '-'}\t"
+                    f"error={row.last_login_error}"
+                )
+    elif args.command == "list-pending":
+        for row in storage.list_pending_actions():
+            print(
+                f"job={row.job_id}\tuser={row.user_id}\taction={row.action_type}\t"
+                f"target={row.target_section or '-'}\tcreated_at={row.created_at}"
+            )
+    elif args.command == "set-interval":
+        storage.set_interval_secs(args.seconds)
+        print(f"interval_secs={storage.get_interval_secs()}")
+    elif args.command == "init-db":
+        print(f"initialized {storage.path}")
+
+
+if __name__ == "__main__":
+    main()

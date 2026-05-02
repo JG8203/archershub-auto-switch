@@ -1,30 +1,43 @@
 import unittest
 
-import login_requests as lr
+from archershub.auth import looks_like_captcha, sanitize_captcha_text
+from archershub.constants import CHANGE_SECTION_TYPE_ID
+from archershub.sections import (
+    available_slots,
+    effective_capacity,
+    find_target_section,
+    is_section_open,
+)
+from archershub.switching import (
+    build_change_section_payload,
+    build_drop_add_payload,
+    resolve_add_drop_reason,
+    resolve_change_reason,
+)
 
 
 class AutoSwitchHelperTests(unittest.TestCase):
     def test_sanitize_captcha_text(self):
-        self.assertEqual(lr.sanitize_captcha_text(" ahm-vbm\n"), "AHMVBM")
-        self.assertTrue(lr.looks_like_captcha("AHMVBM"))
-        self.assertFalse(lr.looks_like_captcha("AHMVB"))
+        self.assertEqual(sanitize_captcha_text(" ahm-vbm\n"), "AHMVBM")
+        self.assertTrue(looks_like_captcha("AHMVBM"))
+        self.assertFalse(looks_like_captcha("AHMVB"))
 
     def test_section_open_uses_updated_capacity_when_present(self):
         section = {"capacity": 45, "updated_capacity": 50, "enlisted": 45}
-        self.assertEqual(lr.effective_capacity(section), 50)
-        self.assertEqual(lr.available_slots(section), 5)
-        self.assertTrue(lr.is_section_open(section))
+        self.assertEqual(effective_capacity(section), 50)
+        self.assertEqual(available_slots(section), 5)
+        self.assertTrue(is_section_open(section))
 
     def test_section_open_falls_back_to_capacity(self):
         section = {"capacity": "45", "updated_capacity": 0, "enlisted": "45"}
-        self.assertFalse(lr.is_section_open(section))
+        self.assertFalse(is_section_open(section))
 
     def test_find_target_section_matches_normalized_name(self):
         data = [
             {"section_name": "C01", "section_creation_id": 1},
             {"section_name": " y03 ", "section_creation_id": 2},
         ]
-        self.assertEqual(lr.find_target_section(data, "Y03")["section_creation_id"], 2)
+        self.assertEqual(find_target_section(data, "Y03")["section_creation_id"], 2)
 
     def test_resolve_change_reason_matches_text(self):
         data = {
@@ -34,7 +47,7 @@ class AutoSwitchHelperTests(unittest.TestCase):
                 {"acd_add_drop_reason_id": 11, "add_drop_id": 3, "reason": "Schedule conflict"},
             ],
         }
-        self.assertEqual(lr.resolve_change_reason(data, reason_text="schedule"), "11")
+        self.assertEqual(resolve_change_reason(data, reason_text="schedule"), "11")
 
     def test_resolve_change_reason_uses_first_required_reason(self):
         data = {
@@ -44,7 +57,7 @@ class AutoSwitchHelperTests(unittest.TestCase):
                 {"acd_add_drop_reason_id": 12, "add_drop_id": 3, "reason": "Second"},
             ],
         }
-        self.assertEqual(lr.resolve_change_reason(data), "11")
+        self.assertEqual(resolve_change_reason(data), "11")
 
     def test_build_change_section_payload(self):
         state = {"change_section_rule": [{"is_approval_applicable": 0, "is_add_fee": 0, "add_drop_rule_id": 77}]}
@@ -58,13 +71,13 @@ class AutoSwitchHelperTests(unittest.TestCase):
             "demandpg_id": 0,
         }
         target = {"section_creation_id": 200}
-        payload = lr.build_change_section_payload(
+        payload = build_change_section_payload(
             state=state,
             current_course=current,
             target_section=target,
             reason_id="11",
         )
-        self.assertEqual(payload["TYPE_ID"], lr.CHANGE_SECTION_TYPE_ID)
+        self.assertEqual(payload["TYPE_ID"], CHANGE_SECTION_TYPE_ID)
         self.assertEqual(payload["REASON_ID"], "11")
         self.assertEqual(payload["ADD_DROP_RULE_ID"], "77")
         self.assertEqual(
@@ -105,7 +118,7 @@ class AutoSwitchHelperTests(unittest.TestCase):
             "is_exclude": 0,
             "is_mandatory": 0,
         }
-        payload = lr.build_drop_add_payload(
+        payload = build_drop_add_payload(
             state=state,
             drop_course=drop_course,
             target_section={"section_creation_id": 900},
@@ -128,8 +141,8 @@ class AutoSwitchHelperTests(unittest.TestCase):
                 {"acd_add_drop_reason_id": 5, "add_drop_id": 1, "reason": "Want to Study Course"},
             ]
         }
-        self.assertEqual(lr.resolve_add_drop_reason(data, "2", reason_text="schedule"), "3")
-        self.assertEqual(lr.resolve_add_drop_reason(data, "1", reason_text="study"), "5")
+        self.assertEqual(resolve_add_drop_reason(data, "2", reason_text="schedule"), "3")
+        self.assertEqual(resolve_add_drop_reason(data, "1", reason_text="study"), "5")
 
 
 if __name__ == "__main__":
