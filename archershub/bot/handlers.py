@@ -395,7 +395,11 @@ class TelegramControlPanel:
         if not user:
             await update.effective_message.reply_text("Register first with /start <code>.")
             return
-        jobs = [job for job in self.storage.list_jobs(user_id=user.id) if job.job_type in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}]
+        jobs = [
+            job
+            for job in self.storage.list_jobs(user_id=user.id)
+            if job.enabled and job.job_type in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}
+        ]
         pending_by_job = {item.job_id: item for item in self.storage.list_pending_actions(user_id=user.id)}
         if not jobs:
             await update.effective_message.reply_text(
@@ -500,7 +504,7 @@ class TelegramControlPanel:
             await update.effective_message.reply_text("Usage: /remove JOB_ID\nExample: /remove 12")
             return
         self.storage.disable_job(int(ctx.args[0]))
-        await update.effective_message.reply_text(f"Disabled job #{ctx.args[0]}.")
+        await update.effective_message.reply_text(f"Removed job #{ctx.args[0]} from your active list.")
 
     def _registered(self, update: Update):
         chat = update.effective_chat

@@ -128,6 +128,22 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job.section_filters, ["Z18", "Z19"])
             self.assertIn("Saved watch job", update.effective_message.replies[0][0])
 
+    async def test_removed_job_disappears_from_jobs_ui(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 987, "tester")
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code="LCFAITH")
+            panel = TelegramControlPanel(storage, AsyncMock())
+
+            remove_update = fake_update(user.telegram_id)
+            await panel.remove(remove_update, SimpleNamespace(args=[str(job.id)]))
+
+            jobs_update = fake_update(user.telegram_id)
+            await panel.jobs(jobs_update, SimpleNamespace())
+
+            self.assertIn("Removed job", remove_update.effective_message.replies[0][0])
+            self.assertIn("No jobs yet", jobs_update.effective_message.replies[0][0])
+
     async def test_recheck_runs_selected_user_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
