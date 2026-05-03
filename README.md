@@ -215,6 +215,7 @@ Captcha behavior:
 
 - Bot logins use automated OCR only; they do not fall back to terminal prompts.
 - Each automated login attempt loads a fresh login page and fresh captcha image.
+- Bot login failures save `login_result.html`, `captcha.png`, and `cookies.json` in the service working directory for inspection. Keep these artifacts private and delete them after debugging.
 - If automated captcha solving fails 5 times in a row, the bot sends the latest captcha image to the Telegram user.
 
 Scheduler behavior:

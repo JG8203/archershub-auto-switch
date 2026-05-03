@@ -88,7 +88,7 @@ class BotArchersHubService:
                 password,
                 max_attempts=DEFAULT_MAX_LOGIN_ATTEMPTS,
                 captcha_ocr=True,
-                save_artifacts=False,
+                save_artifacts=True,
                 captcha_reader=captcha_reader,
                 manual_captcha_fallback=False,
             )
@@ -124,7 +124,7 @@ class BotArchersHubService:
             password=password,
             session=session,
             allow_mutation=False,
-            save_login_artifacts=False,
+            save_login_artifacts=True,
         )
 
     def _load_course_bundle(self, job: JobRecord) -> tuple[Any, dict[str, str], Any]:
@@ -148,7 +148,7 @@ class BotArchersHubService:
                 password or "",
                 max_attempts=DEFAULT_MAX_LOGIN_ATTEMPTS,
                 captcha_ocr=True,
-                save_artifacts=False,
+                save_artifacts=True,
                 manual_captcha_fallback=False,
             )
             self.storage.clear_user_captcha_needed(job.user_id)
