@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -23,7 +25,8 @@ from .service import BotArchersHubService, TelegramCaptchaRequired
     ASK_CHANGE_SECTION,
     ASK_WATCH_COURSE,
     ASK_WATCH_SECTIONS,
-) = range(9)
+    ASK_SEARCH_QUERY,
+) = range(10)
 
 
 class TelegramControlPanel:
@@ -83,6 +86,15 @@ class TelegramControlPanel:
                 name="watch_only_wizard",
                 persistent=False,
             ),
+            ConversationHandler(
+                entry_points=[CommandHandler("search", self.search), CallbackQueryHandler(self.begin_search_wizard, pattern="^menu:search$")],
+                states={
+                    ASK_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_search_query)],
+                },
+                fallbacks=[CommandHandler("cancel", self.cancel)],
+                name="course_search",
+                persistent=False,
+            ),
             CommandHandler("help", self.help),
             CommandHandler("watch", self.watch),
             CommandHandler("change", self.change_section_job),
@@ -96,6 +108,7 @@ class TelegramControlPanel:
             CommandHandler("recheck", self.recheck),
             CommandHandler("remove", self.remove),
             CommandHandler("cancel", self.cancel),
+            CallbackQueryHandler(self.course_search_callback, pattern="^cs:"),
             CallbackQueryHandler(self.menu_callback, pattern="^menu:(jobs|help)$"),
             MessageHandler(filters.COMMAND, self.unknown_command),
         ]
@@ -104,6 +117,7 @@ class TelegramControlPanel:
     def main_menu_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
+                [InlineKeyboardButton("🔎 Search courses", callback_data="menu:search")],
                 [InlineKeyboardButton("➕ Add a class", callback_data="menu:add")],
                 [InlineKeyboardButton("🔁 Change section", callback_data="menu:change")],
                 [InlineKeyboardButton("👀 Watch only", callback_data="menu:watch")],
@@ -120,7 +134,8 @@ class TelegramControlPanel:
             "I will not drop or change existing classes to make room.\n\n"
             "🔁 Change section: use this when you already have the class and only want a different section. "
             "This uses ArchersHub's change-section function only, never drop-add.\n\n"
-            "👀 Watch only: get notified when sections open without submitting anything."
+            "👀 Watch only: get notified when sections open without submitting anything.\n\n"
+            "🔎 Course Search: search Course Finder, reveal teachers when available, and create jobs from results."
         )
 
     @staticmethod
@@ -173,6 +188,7 @@ class TelegramControlPanel:
             "ArchersHub Bot Help\n\n"
             "Create jobs:\n"
             "• /watch LCFAITH Z18 Z19 — notify when matching sections get slots.\n"
+            "• /search LCFAITH — search Course Finder and choose sections/actions.\n"
             "• /addclass LCFAITH:Z18,Z19 — add a class you do not have yet. Priorities are optional.\n"
             "• /addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm — add multiple classes and submit pending adds as one add/drop batch.\n"
             "• /change LCFAITH Z18 — change an existing class to section Z18.\n\n"
@@ -468,6 +484,254 @@ class TelegramControlPanel:
             reply_markup=self.main_menu_markup(),
         )
         return ConversationHandler.END
+
+    async def begin_search_wizard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        if update.callback_query:
+            await update.callback_query.answer()
+        user = self._registered(update)
+        if not user:
+            await self._reply_access_required(update)
+            return ConversationHandler.END
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
+            return ConversationHandler.END
+        ctx.user_data.clear()
+        await update.effective_message.reply_text("Course Search\n\nSend a subject code or keyword, e.g. LCFAITH or accounting.")
+        return ASK_SEARCH_QUERY
+
+    async def search(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._registered(update)
+        if not user:
+            await self._reply_access_required(update)
+            return ConversationHandler.END
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
+            return ConversationHandler.END
+        if not ctx.args:
+            await update.effective_message.reply_text("Course Search\n\nSend a subject code or keyword, e.g. LCFAITH or accounting.")
+            return ASK_SEARCH_QUERY
+        await self._run_course_search(update, user, " ".join(ctx.args))
+        return ConversationHandler.END
+
+    async def received_search_query(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._registered(update)
+        if not user:
+            await self._reply_access_required(update)
+            return ConversationHandler.END
+        await self._run_course_search(update, user, update.effective_message.text.strip())
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    async def _run_course_search(self, update: Update, user, query: str) -> None:
+        query = query.strip()
+        if not query:
+            await update.effective_message.reply_text("Send a subject code or keyword, e.g. LCFAITH or accounting.")
+            return
+        status = await update.effective_message.reply_text(f"Searching Course Finder for {query!r}...")
+        try:
+            courses = await self.archershub.search_courses_for_user(user.id, query)
+        except TelegramCaptchaRequired as exc:
+            await status.edit_text(str(exc))
+            return
+        except Exception as exc:
+            await status.edit_text(f"Course search failed: {exc}")
+            return
+        if not courses:
+            await status.edit_text(f"No Course Finder matches for {query!r}.")
+            return
+        token = secrets.token_hex(4)
+        self._save_search_state(user.id, {"token": token, "created_at": time.time(), "query": query, "courses": courses, "sections": {}})
+        await status.edit_text("Search complete.")
+        text, markup = self._course_results_message(token, {"query": query, "courses": courses}, 0)
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+    async def course_search_callback(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.callback_query:
+            await update.callback_query.answer()
+        user = self._registered(update)
+        if not user:
+            await self._reply_access_required(update)
+            return
+        data = update.callback_query.data if update.callback_query else ""
+        parts = data.split(":")
+        if len(parts) < 3:
+            await update.effective_message.reply_text("That search action was invalid. Use /search to start again.")
+            return
+        state = self._load_search_state(user.id, parts[2])
+        if state is None:
+            await update.effective_message.reply_text("That search expired. Use /search to start again.")
+            return
+        kind = parts[1]
+        if kind == "r" and len(parts) >= 4:
+            text, markup = self._course_results_message(parts[2], state, int(parts[3]))
+            await update.effective_message.reply_text(text, reply_markup=markup)
+            return
+        if kind == "c" and len(parts) >= 4:
+            await self._show_search_course_sections(update, user, state, parts[2], int(parts[3]), 0)
+            return
+        if kind == "sp" and len(parts) >= 5:
+            await self._show_search_course_sections(update, user, state, parts[2], int(parts[3]), int(parts[4]))
+            return
+        if kind == "s" and len(parts) >= 5:
+            text, markup = self._section_actions_message(parts[2], state, int(parts[3]), int(parts[4]))
+            await update.effective_message.reply_text(text, reply_markup=markup)
+            return
+        if kind == "addall" and len(parts) >= 4:
+            await self._create_search_job(update, user, state, int(parts[3]), None, "addall")
+            return
+        if kind == "a" and len(parts) >= 6:
+            await self._create_search_job(update, user, state, int(parts[4]), int(parts[5]), parts[3])
+            return
+        await update.effective_message.reply_text("That search action was invalid. Use /search to start again.")
+
+    async def _show_search_course_sections(self, update: Update, user, state: dict, token: str, course_index: int, page: int) -> None:
+        courses = state.get("courses") or []
+        if course_index < 0 or course_index >= len(courses):
+            await update.effective_message.reply_text("That course result was not found. Use /search to start again.")
+            return
+        section_cache = state.setdefault("sections", {})
+        cache_key = str(course_index)
+        if cache_key not in section_cache:
+            status = await update.effective_message.reply_text("Loading sections and revealing teachers when available...")
+            try:
+                section_cache[cache_key] = await self.archershub.fetch_search_course_sections(user.id, courses[course_index])
+                self._save_search_state(user.id, state)
+            except TelegramCaptchaRequired as exc:
+                await status.edit_text(str(exc))
+                return
+            except Exception as exc:
+                await status.edit_text(f"Could not load sections: {exc}")
+                return
+            await status.edit_text("Sections loaded.")
+        text, markup = self._section_results_message(token, state, course_index, page)
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+    async def _create_search_job(self, update: Update, user, state: dict, course_index: int, section_index: int | None, action: str) -> None:
+        courses = state.get("courses") or []
+        if course_index < 0 or course_index >= len(courses):
+            await update.effective_message.reply_text("That course result was not found. Use /search to start again.")
+            return
+        course = courses[course_index]
+        course_code = str(course.get("course_code") or "").upper()
+        section = None
+        if section_index is not None:
+            section = self._section_at(state, course_index, section_index)
+            if section is None:
+                await update.effective_message.reply_text("That section result was not found. Open the course from search again.")
+                return
+        if action == "watch":
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code=course_code, section_filters=[section["section_name"]])
+            await update.effective_message.reply_text(f"Saved watch job #{job.id} for {course_code} {section['section_name']}.", reply_markup=self.main_menu_markup())
+        elif action == "add":
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, priority_sections=[section["section_name"]])
+            await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
+        elif action == "change":
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_CHANGE_SECTION, mode=JOB_MODE_AUTO, course_code=course_code, target_section=section["section_name"])
+            await update.effective_message.reply_text(self._change_job_confirmation(job), reply_markup=self.main_menu_markup())
+        elif action == "addall":
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, priority_sections=[])
+            await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
+        else:
+            await update.effective_message.reply_text("That search action was invalid. Use /search to start again.")
+
+    @staticmethod
+    def _course_results_message(token: str, state: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        courses = state.get("courses") or []
+        page_size = 5
+        max_page = max(0, (len(courses) - 1) // page_size)
+        page = max(0, min(page, max_page))
+        start = page * page_size
+        shown = courses[start:start + page_size]
+        lines = [f"Course Search: {state.get('query', '')}", f"Results {start + 1}-{start + len(shown)} of {len(courses)}"]
+        rows = []
+        for offset, course in enumerate(shown):
+            idx = start + offset
+            label = f"{course.get('course_code')} — {course.get('course_name')}"
+            lines.append(f"{idx + 1}. {label}")
+            rows.append([InlineKeyboardButton(label[:60], callback_data=f"cs:c:{token}:{idx}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("<<", callback_data=f"cs:r:{token}:{page - 1}"))
+        if page < max_page:
+            nav.append(InlineKeyboardButton(">>", callback_data=f"cs:r:{token}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _section_results_message(token: str, state: dict, course_index: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        courses = state.get("courses") or []
+        course = courses[course_index]
+        sections = ((state.get("sections") or {}).get(str(course_index))) or []
+        page_size = 5
+        if not sections:
+            return f"No sections found for {course.get('course_code')}.", InlineKeyboardMarkup([[InlineKeyboardButton("Add entire subject", callback_data=f"cs:addall:{token}:{course_index}")]])
+        max_page = max(0, (len(sections) - 1) // page_size)
+        page = max(0, min(page, max_page))
+        start = page * page_size
+        shown = sections[start:start + page_size]
+        lines = [f"{course.get('course_code')} sections", f"{course.get('course_name')}", f"Results {start + 1}-{start + len(shown)} of {len(sections)}"]
+        rows = []
+        for offset, section in enumerate(shown):
+            idx = start + offset
+            status = "OPEN" if float(section.get("available") or 0) > 0 else "FULL"
+            lines.append(
+                f"{idx + 1}. {section.get('section_name')}: {status} "
+                f"({float(section.get('available') or 0):g} slots, {float(section.get('enlisted') or 0):g}/{float(section.get('capacity') or 0):g})\n"
+                f"Teacher: {section.get('teacher') or '-'}\n"
+                f"Schedule: {section.get('schedule') or '-'}"
+            )
+            rows.append([InlineKeyboardButton(f"{section.get('section_name')} actions", callback_data=f"cs:s:{token}:{course_index}:{idx}")])
+        rows.append([InlineKeyboardButton("Add entire subject", callback_data=f"cs:addall:{token}:{course_index}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("<<", callback_data=f"cs:sp:{token}:{course_index}:{page - 1}"))
+        if page < max_page:
+            nav.append(InlineKeyboardButton(">>", callback_data=f"cs:sp:{token}:{course_index}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        return "\n\n".join(lines), InlineKeyboardMarkup(rows)
+
+    def _section_actions_message(self, token: str, state: dict, course_index: int, section_index: int) -> tuple[str, InlineKeyboardMarkup]:
+        courses = state.get("courses") or []
+        course = courses[course_index]
+        section = self._section_at(state, course_index, section_index)
+        if section is None:
+            return "That section result was not found. Open the course from search again.", InlineKeyboardMarkup([])
+        text = (
+            f"{course.get('course_code')} {section.get('section_name')}\n"
+            f"Teacher: {section.get('teacher') or '-'}\n"
+            f"Schedule: {section.get('schedule') or '-'}\n"
+            f"Available: {float(section.get('available') or 0):g} slots"
+        )
+        return text, InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("👀 Watch section", callback_data=f"cs:a:{token}:watch:{course_index}:{section_index}")],
+                [InlineKeyboardButton("➕ Add with priority", callback_data=f"cs:a:{token}:add:{course_index}:{section_index}")],
+                [InlineKeyboardButton("🔁 Change to section", callback_data=f"cs:a:{token}:change:{course_index}:{section_index}")],
+            ]
+        )
+
+    def _section_at(self, state: dict, course_index: int, section_index: int) -> dict | None:
+        sections = ((state.get("sections") or {}).get(str(course_index))) or []
+        if section_index < 0 or section_index >= len(sections):
+            return None
+        return sections[section_index]
+
+    def _search_snapshot_key(self, user_id: int) -> str:
+        return f"telegram:course-search:{user_id}"
+
+    def _save_search_state(self, user_id: int, state: dict) -> None:
+        self.storage.set_snapshot(self._search_snapshot_key(user_id), state)
+
+    def _load_search_state(self, user_id: int, token: str) -> dict | None:
+        state = self.storage.get_snapshot(self._search_snapshot_key(user_id))
+        if not isinstance(state, dict) or state.get("token") != token:
+            return None
+        if time.time() - float(state.get("created_at") or 0) > 1800:
+            self.storage.delete_snapshot(self._search_snapshot_key(user_id))
+            return None
+        return state
 
     async def set_mode(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         job = await self._owned_job_or_reply(update, ctx, usage="Usage: /setmode JOB_ID notify|confirm|auto\nExample: /setmode 12 confirm")

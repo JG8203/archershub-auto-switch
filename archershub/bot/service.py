@@ -11,6 +11,7 @@ from ..api import first_list, flatten_jquery_form, normalize_value, post_form_js
 from ..auth import AutomatedCaptchaEscalation, apply_session_cookies_json, create_session, login_with_retry, session_cookies_json
 from ..client import ArchersHubClient
 from ..constants import AutoSwitchSubmitError, DEFAULT_BASE_URL, DEFAULT_LOGIN_PATH, DEFAULT_MAX_LOGIN_ATTEMPTS
+from ..course_search import compact_course, course_from_dict, course_search_context, fetch_course_options, reveal_teachers_with_schedule_data, search_courses, section_summary
 from ..crypto import SecretBox
 from ..jobs import AutomationBatchResult, AutomationCandidate, choose_add_class_section, plan_change_section
 from ..sections import fetch_course_data, resolve_course_target
@@ -161,6 +162,78 @@ class BotArchersHubService:
             target = resolve_course_target(session, self.base_url, job.course_code)
             course_data = fetch_course_data(session, self.base_url, target)
             return session, target, course_data
+
+
+    def _credentials_session(self, user_id: int) -> tuple[Any, CredentialRecord, str | None, str | None]:
+        credentials = self.storage.get_credentials(user_id)
+        if credentials is None:
+            raise RuntimeError("user has no ArchersHub credentials")
+        username = self.secret_box.decrypt_text(credentials.username_encrypted)
+        password = self.secret_box.decrypt_text(credentials.password_encrypted)
+        session = create_session()
+        apply_session_cookies_json(session, self.secret_box.decrypt_text(credentials.cookies_encrypted))
+        return session, credentials, username, password
+
+    def _relogin_user(self, user_id: int, credentials: CredentialRecord, username: str | None, password: str | None) -> Any:
+        session = login_with_retry(
+            self.base_url,
+            DEFAULT_LOGIN_PATH,
+            username or "",
+            password or "",
+            max_attempts=DEFAULT_MAX_LOGIN_ATTEMPTS,
+            captcha_ocr=True,
+            save_artifacts=True,
+            manual_captcha_fallback=False,
+        )
+        self.storage.clear_user_captcha_needed(user_id)
+        self.storage.save_credentials(
+            user_id,
+            credentials.username_encrypted,
+            credentials.password_encrypted,
+            self.secret_box.encrypt_text(session_cookies_json(session)),
+        )
+        return session
+
+    def _with_user_session_retry(self, user_id: int, operation):
+        session, credentials, username, password = self._credentials_session(user_id)
+        try:
+            return operation(session)
+        except Exception:
+            session = self._relogin_user(user_id, credentials, username, password)
+            return operation(session)
+
+    async def search_courses_for_user(self, user_id: int, query: str) -> list[dict[str, str]]:
+        try:
+            def load(session):
+                context = course_search_context(session, self.base_url)
+                return [compact_course(course) for course in search_courses(fetch_course_options(session, self.base_url, context), query)]
+            return await asyncio.to_thread(lambda: self._with_user_session_retry(user_id, load))
+        except AutomatedCaptchaEscalation as exc:
+            await self._notify_captcha_escalation(user_id, exc)
+            raise TelegramCaptchaRequired(
+                f"Automatic captcha solving failed after {exc.attempts} attempts while searching courses. "
+                "I sent the latest captcha image to the user."
+            ) from exc
+
+    async def fetch_search_course_sections(self, user_id: int, course_data: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            def load(session):
+                course = course_from_dict(course_data)
+                sections = fetch_course_data(session, self.base_url, course.as_target())
+                if not isinstance(sections, list):
+                    sections = []
+                try:
+                    sections = reveal_teachers_with_schedule_data(session, self.base_url, course, sections)
+                except Exception:
+                    pass
+                return [section_summary(section) for section in sections if isinstance(section, dict)]
+            return await asyncio.to_thread(lambda: self._with_user_session_retry(user_id, load))
+        except AutomatedCaptchaEscalation as exc:
+            await self._notify_captcha_escalation(user_id, exc)
+            raise TelegramCaptchaRequired(
+                f"Automatic captcha solving failed after {exc.attempts} attempts while loading sections. "
+                "I sent the latest captcha image to the user."
+            ) from exc
 
     async def fetch_course_for_job(self, job: JobRecord) -> Any:
         try:
