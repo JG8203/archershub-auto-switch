@@ -50,12 +50,13 @@ jobs:
 
       - name: Deploy to Raspberry Pi
         run: |
-          ssh -o StrictHostKeyChecking=accept-new "armaine@${{ secrets.PI_HOST }}" <<'EOF'
+          ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "armaine@${{ secrets.PI_HOST }}" <<'EOF'
           set -euo pipefail
           cd /home/armaine/archershub-auto-switch
           git fetch origin main
           git reset --hard origin/main
-          poetry install --only main
-          sudo systemctl restart archershub-bot
-          sudo systemctl is-active --quiet archershub-bot
+          poetry install --only main --no-interaction
+          sudo -n systemctl restart archershub-bot
+          sleep 3
+          sudo -n systemctl is-active --quiet archershub-bot
           EOF
