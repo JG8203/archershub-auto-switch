@@ -272,15 +272,27 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             user = storage.redeem_registration_code(storage.generate_registration_code(), 657, "tester")
             save_dummy_credentials(storage, user.id)
             service = AsyncMock()
-            service.resolve_course_for_user.side_effect = RuntimeError("course code DSILYTC resolved to multiple courses: 1, 2")
+            from archershub.sections import MultipleCoursesFound
+            from unittest.mock import MagicMock
+            service.resolve_course_for_user.side_effect = MultipleCoursesFound(
+                "DSILYTC",
+                [{"course_creation_id": "1", "text": "Choice 1"}, {"course_creation_id": "2", "text": "Choice 2"}],
+                "CAMPUS",
+                "SESSION"
+            )
+            service.format_course_matches = MagicMock(return_value=[
+                {"course_code": "DSILYTC", "course_name": "Choice 1", "course_creation_id": "1"},
+                {"course_code": "DSILYTC", "course_name": "Choice 2", "course_creation_id": "2"},
+            ])
             panel = TelegramControlPanel(storage, service)
             update = fake_update(user.telegram_id)
 
             await panel.watch(update, SimpleNamespace(args=["DSILYTC", "V01"]))
 
             self.assertFalse(storage.list_jobs(user_id=user.id))
-            self.assertIn("multiple Course Finder matches", update.effective_message.replies[0][0])
-            self.assertIn("/search DSILYTC", update.effective_message.replies[0][0])
+            self.assertIn("has multiple Course Finder matches. Please choose", update.effective_message.replies[0][0])
+            # It should show buttons
+            self.assertTrue(update.effective_message.replies[0][1].inline_keyboard)
 
     async def test_watch_wizard_creates_notification_job(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -62,6 +62,19 @@ def extract_course_creation_id(item: dict[str, Any]) -> str | None:
     return None
 
 
+class MultipleCoursesFound(RuntimeError):
+    def __init__(self, course_code: str, matches: list[dict[str, Any]], campus_id: str, academic_session_id: str) -> None:
+        self.course_code = course_code
+        self.matches = matches
+        self.campus_id = campus_id
+        self.academic_session_id = academic_session_id
+        choices = ", ".join(
+            f"{extract_course_creation_id(item)} ({item.get('text') or item.get('course_name') or 'unknown course'})"
+            for item in matches
+        )
+        super().__init__(f"course code {course_code} resolved to multiple courses: {choices}")
+
+
 def resolve_course_target(
     session: requests.Session,
     base_url: str,
@@ -108,11 +121,7 @@ def resolve_course_target(
             f"academic_session_id={academic_session_id}"
         )
     if len(matches) > 1:
-        choices = ", ".join(
-            f"{extract_course_creation_id(item)} ({item.get('text') or item.get('course_name') or 'unknown course'})"
-            for item in matches
-        )
-        raise RuntimeError(f"course code {course_code} resolved to multiple courses: {choices}")
+        raise MultipleCoursesFound(course_code, matches, campus_id, academic_session_id)
 
     selected = matches[0]
     return course_target_from_item(selected, course_code, campus_id, academic_session_id)

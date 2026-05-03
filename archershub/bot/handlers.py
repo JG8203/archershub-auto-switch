@@ -10,7 +10,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 
 from ..constants import AutoSwitchSubmitError
 from ..scheduler import WatchScheduler
-from ..sections import normalize_section_name
+from ..sections import MultipleCoursesFound, normalize_section_name
 from ..storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, SQLiteStorage, UserRecord
 from .messages import delete_message_safely
 from .parsing import MODE_VALUES, parse_addclass_specs
@@ -1050,14 +1050,19 @@ class TelegramControlPanel:
         except TelegramCaptchaRequired as exc:
             await update.effective_message.reply_text(str(exc))
             return None
+        except MultipleCoursesFound as exc:
+            courses = self.archershub.format_course_matches(exc.matches, exc.campus_id, exc.academic_session_id)
+            token = secrets.token_hex(4)
+            self._save_search_state(user_id, {"token": token, "created_at": time.time(), "query": course_code, "courses": courses, "sections": {}})
+            _, markup = self._course_results_message(token, {"query": course_code, "courses": courses}, 0)
+            await update.effective_message.reply_text(
+                f"{course_code} has multiple Course Finder matches. Please choose the exact offering below:",
+                reply_markup=markup
+            )
+            return None
         except Exception as exc:
             message = str(exc)
-            if "resolved to multiple courses" in message:
-                await update.effective_message.reply_text(
-                    f"{course_code} has multiple Course Finder matches. Use 🔎 Search courses or /search {course_code} "
-                    "and choose the exact offering."
-                )
-            elif "was not found" in message:
+            if "was not found" in message:
                 await update.effective_message.reply_text(f"{course_code} was not found in Course Finder.")
             else:
                 await update.effective_message.reply_text(f"Could not resolve {course_code}: {exc}")

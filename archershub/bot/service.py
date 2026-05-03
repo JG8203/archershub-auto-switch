@@ -11,10 +11,10 @@ from ..api import first_list, flatten_jquery_form, normalize_value, post_form_js
 from ..auth import AutomatedCaptchaEscalation, apply_session_cookies_json, create_session, login_with_retry, session_cookies_json
 from ..client import ArchersHubClient
 from ..constants import AutoSwitchSubmitError, DEFAULT_BASE_URL, DEFAULT_LOGIN_PATH, DEFAULT_MAX_LOGIN_ATTEMPTS
-from ..course_search import compact_course, course_from_dict, course_search_context, fetch_course_options, reveal_teachers_with_schedule_data, search_courses, section_summary
+from ..course_search import CourseSearchResult, compact_course, course_display_name, course_from_dict, course_search_context, fetch_course_options, reveal_teachers_with_schedule_data, search_courses, section_summary
 from ..crypto import SecretBox
 from ..jobs import AutomationBatchResult, AutomationCandidate, choose_add_class_section, plan_change_section
-from ..sections import fetch_course_data, resolve_course_target, resolve_course_target_by_id
+from ..sections import extract_course_code, extract_course_creation_id, fetch_course_data, resolve_course_target, resolve_course_target_by_id
 from ..storage import JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, CredentialRecord, JobRecord, SQLiteStorage
 from ..switching import (
     add_academic_session_to_state,
@@ -239,6 +239,22 @@ class BotArchersHubService:
                 f"Automatic captcha solving failed after {exc.attempts} attempts while resolving {course_code}. "
                 "I sent the latest captcha image to the user."
             ) from exc
+
+    def format_course_matches(self, matches: list[dict[str, Any]], campus_id: str, academic_session_id: str) -> list[dict[str, str]]:
+        return [
+            compact_course(
+                CourseSearchResult(
+                    course_code=extract_course_code(item) or "",
+                    course_name=course_display_name(item),
+                    course_creation_id=str(extract_course_creation_id(item)),
+                    campus_id=campus_id,
+                    academic_session_id=academic_session_id,
+                    is_cross_offer=normalize_value(item.get("is_cross_offer")) or "0",
+                    grid_type=normalize_value(item.get("grid_type")) or "0",
+                )
+            )
+            for item in matches
+        ]
 
     async def port_legacy_jobs(self, send_message: Callable[[int, str], Awaitable[None]] | None = None) -> None:
         for job in self.storage.list_jobs(active_only=True):
