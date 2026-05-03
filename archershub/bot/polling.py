@@ -34,6 +34,7 @@ def build_application() -> Application:
         send_message=lambda chat_id, text: tg_app.bot.send_message(chat_id=chat_id, text=text),
         inspect_automation=ah_service.inspect_automation_job,
         execute_automation=ah_service.execute_automation_job,
+        execute_automation_batch=ah_service.execute_automation_batch,
     )
     tg_app.add_handlers(TelegramControlPanel(storage, ah_service, scheduler).build_handlers())
     tg_app.bot_data["storage"] = storage

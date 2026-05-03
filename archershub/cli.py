@@ -199,8 +199,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--switch-strategy",
         choices=[SWITCH_STRATEGY_DROP_ADD, SWITCH_STRATEGY_CHANGE_SECTION],
-        default=SWITCH_STRATEGY_DROP_ADD,
-        help="How --auto-switch-section submits the switch. Defaults to drop-add.",
+        default=SWITCH_STRATEGY_CHANGE_SECTION,
+        help="How --auto-switch-section submits the switch. Defaults to change-section.",
     )
     parser.add_argument("--target-section", help="Target section name for --auto-switch-section, e.g. Y03.")
     parser.add_argument("--change-reason-id", help="Reason id to use if change-section requires a reason.")

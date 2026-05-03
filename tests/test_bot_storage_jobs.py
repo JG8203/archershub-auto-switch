@@ -5,7 +5,7 @@ import unittest
 from archershub.bot.parsing import parse_addclass_specs
 from archershub.bot.service import BotArchersHubService
 from archershub.crypto import SecretBox
-from archershub.jobs import AutomationCandidate, PermanentJobError, choose_add_class_section, plan_change_section
+from archershub.jobs import AutomationBatchResult, AutomationCandidate, PermanentJobError, choose_add_class_section, plan_change_section
 from archershub.notifications import compact_sections, diff_sections, filter_sections, has_changes
 from archershub.scheduler import WatchScheduler
 from archershub.storage import (
@@ -285,6 +285,78 @@ class SchedulerTests(unittest.TestCase):
                 self.assertIsNotNone(storage.get_job(confirm_job.id))
                 self.assertIsNotNone(storage.get_job(auto_job.id).completed_at)
                 self.assertEqual(len(sent), 2)
+
+        asyncio.run(scenario())
+
+    def test_scheduler_batches_auto_addclass_jobs_when_batch_callback_exists(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+                user = storage.redeem_registration_code(storage.generate_registration_code(), 112)
+                job_one = storage.add_job(
+                    user_id=user.id,
+                    job_type=JOB_TYPE_ADD_CLASS,
+                    mode=JOB_MODE_AUTO,
+                    course_code="ABC",
+                    priority_sections=["C02"],
+                )
+                job_two = storage.add_job(
+                    user_id=user.id,
+                    job_type=JOB_TYPE_ADD_CLASS,
+                    mode=JOB_MODE_AUTO,
+                    course_code="DEF",
+                    priority_sections=["C03"],
+                )
+                sent = []
+                individual_executed = []
+                batch_calls = []
+
+                async def fetch(_job):
+                    return COURSE_DATA
+
+                async def send(chat_id, text):
+                    sent.append((chat_id, text))
+
+                async def inspect(job):
+                    target = "C02" if job.id == job_one.id else "C03"
+                    return AutomationCandidate(
+                        job_type=job.job_type,
+                        course_code=job.course_code,
+                        action="add_class",
+                        reason="selected section",
+                        target_section_name=target,
+                        dedupe_key=f"add:{target}",
+                        details={"academic_session_id": "1"},
+                    )
+
+                async def execute(job):
+                    individual_executed.append(job.id)
+                    return "should not run"
+
+                async def execute_batch(jobs):
+                    batch_calls.append([job.id for job in jobs])
+                    return AutomationBatchResult(
+                        submitted_job_ids=[job.id for job in jobs],
+                        message="submitted add/drop batch",
+                    )
+
+                scheduler = WatchScheduler(
+                    storage,
+                    fetch,
+                    send,
+                    inspect_automation=inspect,
+                    execute_automation=execute,
+                    execute_automation_batch=execute_batch,
+                )
+                result = await scheduler.run_once()
+
+                self.assertEqual(result.checked_jobs, 2)
+                self.assertEqual(result.notifications_sent, 1)
+                self.assertEqual(batch_calls, [[job_one.id, job_two.id]])
+                self.assertEqual(individual_executed, [])
+                self.assertIn("submitted add/drop batch", sent[0][1])
+                self.assertIsNotNone(storage.get_job(job_one.id).completed_at)
+                self.assertIsNotNone(storage.get_job(job_two.id).completed_at)
 
         asyncio.run(scenario())
 

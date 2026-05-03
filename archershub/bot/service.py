@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+import requests
+
+from ..api import first_list, flatten_jquery_form, normalize_value, post_form_json, string_id
 from ..auth import AutomatedCaptchaEscalation, apply_session_cookies_json, create_session, login_with_retry, session_cookies_json
 from ..client import ArchersHubClient
-from ..constants import DEFAULT_BASE_URL, DEFAULT_LOGIN_PATH, DEFAULT_MAX_LOGIN_ATTEMPTS
+from ..constants import AutoSwitchSubmitError, DEFAULT_BASE_URL, DEFAULT_LOGIN_PATH, DEFAULT_MAX_LOGIN_ATTEMPTS
 from ..crypto import SecretBox
-from ..jobs import AutomationCandidate, choose_add_class_section, plan_change_section
+from ..jobs import AutomationBatchResult, AutomationCandidate, choose_add_class_section, plan_change_section
 from ..sections import fetch_course_data, resolve_course_target
 from ..storage import JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, CredentialRecord, JobRecord, SQLiteStorage
 from ..switching import (
-    build_add_course_payload,
+    add_academic_session_to_state,
+    build_add_courses_payload,
     find_add_course,
     find_current_enlisted_course,
     get_add_drop_state,
@@ -20,11 +26,23 @@ from ..switching import (
     has_course_clash,
     maybe_submit_target_switch,
     resolve_add_drop_reason,
+    submit_add_drop,
 )
 
 
 class TelegramCaptchaRequired(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PreparedAddClass:
+    job: JobRecord
+    session: Any
+    target: dict[str, str]
+    add_state: dict[str, Any]
+    add_course: dict[str, Any]
+    target_section: dict[str, Any]
+    target_section_name: str
 
 
 class BotArchersHubService:
@@ -278,6 +296,8 @@ class BotArchersHubService:
                 target_section_name=str(section.get("section_name") or ""),
                 dedupe_key=f"add:{section.get('section_creation_id')}",
                 details={
+                    "academic_session_id": str(target.get("academic_session_id") or ""),
+                    "course_creation_id": str(target.get("course_creation_id") or ""),
                     "target_section_id": str(section.get("section_creation_id") or ""),
                     "target_schedule": str(section.get("schedule") or ""),
                     "fallback_used": decision.fallback_used,
@@ -299,8 +319,8 @@ class BotArchersHubService:
             ) from exc
 
     def _execute_automation_job_sync(self, job: JobRecord) -> str:
-        session, target, course_data = self._load_course_bundle(job)
         if job.job_type == JOB_TYPE_CHANGE_SECTION:
+            session, target, course_data = self._load_course_bundle(job)
             if not job.target_section:
                 raise RuntimeError("change-section job is missing target section")
             decision = plan_change_section(
@@ -320,65 +340,196 @@ class BotArchersHubService:
             return f"Changed {job.course_code} to section {job.target_section}."
 
         if job.job_type == JOB_TYPE_ADD_CLASS:
-            add_state = get_add_drop_state(session, self.base_url, target["academic_session_id"])
-            campus_no = str(add_state.get("campusno") or target["campus_id"])
-            decision = choose_add_class_section(
-                course_data,
-                priority_sections=job.priority_sections,
-                clashes=lambda section: has_course_clash(
-                    session,
-                    self.base_url,
-                    target["academic_session_id"],
-                    target["course_creation_id"],
-                    str(section.get("section_creation_id") or ""),
-                    campus_no,
-                ),
-            )
-            if decision.selected_section is None:
-                raise RuntimeError(decision.reason)
-            target_section = decision.selected_section
-            add_course = self._find_add_course(add_state, target["course_code"], target["course_creation_id"])
-            if add_course is None:
-                raise RuntimeError(f"{job.course_code} is not add-eligible right now")
-            section_data = get_course_wise_section_data(
-                session,
-                self.base_url,
-                target["academic_session_id"],
-                target["course_creation_id"],
-                target["is_cross_offer"],
-                target["grid_type"],
-            )
-            available_ids = {
-                str(row.get("section_creation_id"))
-                for row in section_data.get("section_details", [])
-                if isinstance(row, dict)
-            }
-            target_section_id = str(target_section.get("section_creation_id") or "")
-            if available_ids and target_section_id not in available_ids:
-                raise RuntimeError("selected section is no longer available for add-course")
-            if has_course_clash(
-                session,
-                self.base_url,
-                target["academic_session_id"],
-                target["course_creation_id"],
-                target_section_id,
-                campus_no,
-            ):
-                raise RuntimeError(f"selected section {target_section.get('section_name')} has a schedule clash")
-            reason_required = str(add_state.get("is_mandatory", "0")) == "1"
-            add_reason_id = resolve_add_drop_reason(add_state, "1", required=reason_required)
-            payload = build_add_course_payload(
-                state={**add_state, "academic_session_id": target["academic_session_id"]},
-                add_course=add_course,
-                target_section=target_section,
-                add_reason_id=add_reason_id,
-            )
-            from ..switching import submit_add_drop
-
-            submit_add_drop(session, self.base_url, payload)
-            return f"Added {job.course_code} section {target_section.get('section_name')}."
+            return self._execute_add_class_batch_sync([job]).message
 
         raise RuntimeError(f"unsupported automation job type: {job.job_type}")
+
+    async def execute_automation_batch(self, jobs: list[JobRecord]) -> AutomationBatchResult:
+        try:
+            return await asyncio.to_thread(self._execute_add_class_batch_sync, jobs)
+        except AutomatedCaptchaEscalation as exc:
+            user_id = jobs[0].user_id if jobs else 0
+            await self._notify_captcha_escalation(user_id, exc)
+            raise TelegramCaptchaRequired(
+                f"Automatic captcha solving failed after {exc.attempts} attempts for an add/drop batch. "
+                "I sent the latest captcha image to the user."
+            ) from exc
+
+    def _execute_add_class_batch_sync(self, jobs: list[JobRecord]) -> AutomationBatchResult:
+        if not jobs:
+            raise RuntimeError("add/drop batch is empty")
+        user_ids = {job.user_id for job in jobs}
+        if len(user_ids) != 1:
+            raise RuntimeError("add/drop batch can only include one user")
+        if any(job.job_type != JOB_TYPE_ADD_CLASS for job in jobs):
+            raise RuntimeError("add/drop batch can only include add-class jobs")
+
+        prepared = [self._prepare_add_class_job(job) for job in jobs]
+        academic_session_ids = {item.target["academic_session_id"] for item in prepared}
+        if len(academic_session_ids) != 1:
+            raise RuntimeError("add/drop batch can only include one academic session")
+
+        academic_session_id = prepared[0].target["academic_session_id"]
+        add_state = add_academic_session_to_state(prepared[0].add_state, academic_session_id)
+        reason_required = str(add_state.get("is_mandatory", "0")) == "1"
+        add_reason_id = resolve_add_drop_reason(add_state, "1", required=reason_required)
+        payload = build_add_courses_payload(
+            state=add_state,
+            additions=[(item.add_course, item.target_section) for item in prepared],
+            add_reason_id=add_reason_id,
+        )
+        self._check_add_class_batch_clashes(prepared)
+        lines = ["Added through one add/drop submission:"]
+        lines.extend(f"• {item.job.course_code} section {item.target_section_name}" for item in prepared)
+        message = "\n".join(lines)
+        try:
+            submit_add_drop(prepared[0].session, self.base_url, payload)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            time.sleep(10)
+            if self._add_class_batch_reflected(prepared):
+                return AutomationBatchResult(
+                    submitted_job_ids=[item.job.id for item in prepared],
+                    message=message,
+                )
+            raise AutoSwitchSubmitError(
+                "add/drop batch submit was attempted but could not be verified; "
+                "stopping to avoid a second add/drop submission"
+            ) from exc
+        except Exception as exc:
+            time.sleep(10)
+            if self._add_class_batch_reflected(prepared):
+                return AutomationBatchResult(
+                    submitted_job_ids=[item.job.id for item in prepared],
+                    message=message,
+                )
+            raise AutoSwitchSubmitError(
+                "add/drop batch submit was attempted but did not return a clean success; "
+                "stopping to avoid a second add/drop submission"
+            ) from exc
+
+        return AutomationBatchResult(
+            submitted_job_ids=[item.job.id for item in prepared],
+            message=message,
+        )
+
+    def _prepare_add_class_job(self, job: JobRecord) -> PreparedAddClass:
+        session, target, course_data = self._load_course_bundle(job)
+        add_state = get_add_drop_state(session, self.base_url, target["academic_session_id"])
+        try:
+            find_current_enlisted_course(add_state, target["course_code"], target["course_creation_id"])
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(f"{job.course_code} is already enlisted; use change-section instead of add/drop")
+
+        campus_no = str(add_state.get("campusno") or target["campus_id"])
+        decision = choose_add_class_section(
+            course_data,
+            priority_sections=job.priority_sections,
+            clashes=lambda section: has_course_clash(
+                session,
+                self.base_url,
+                target["academic_session_id"],
+                target["course_creation_id"],
+                str(section.get("section_creation_id") or ""),
+                campus_no,
+            ),
+        )
+        if decision.selected_section is None:
+            raise RuntimeError(decision.reason)
+        target_section = decision.selected_section
+        add_course = self._find_add_course(add_state, target["course_code"], target["course_creation_id"])
+        if add_course is None:
+            raise RuntimeError(f"{job.course_code} is not add-eligible right now")
+        section_data = get_course_wise_section_data(
+            session,
+            self.base_url,
+            target["academic_session_id"],
+            target["course_creation_id"],
+            target["is_cross_offer"],
+            target["grid_type"],
+        )
+        available_ids = {
+            str(row.get("section_creation_id"))
+            for row in section_data.get("section_details", [])
+            if isinstance(row, dict)
+        }
+        target_section_id = str(target_section.get("section_creation_id") or "")
+        if available_ids and target_section_id not in available_ids:
+            raise RuntimeError("selected section is no longer available for add-course")
+        if has_course_clash(
+            session,
+            self.base_url,
+            target["academic_session_id"],
+            target["course_creation_id"],
+            target_section_id,
+            campus_no,
+        ):
+            raise RuntimeError(f"selected section {target_section.get('section_name')} has a schedule clash")
+        return PreparedAddClass(
+            job=job,
+            session=session,
+            target=target,
+            add_state=add_state,
+            add_course=add_course,
+            target_section=target_section,
+            target_section_name=str(target_section.get("section_name") or ""),
+        )
+
+    def _check_add_class_batch_clashes(self, prepared: list[PreparedAddClass]) -> None:
+        if not prepared:
+            return
+        state = prepared[0].add_state
+        academic_session_id = prepared[0].target["academic_session_id"]
+        campus_no = string_id(state.get("campusno") or prepared[0].target["campus_id"])
+        course_list: list[dict[str, str]] = []
+        for row in first_list(state, "get_enlisted_subject"):
+            if not isinstance(row, dict):
+                continue
+            course_creation_id = string_id(row.get("course_creation_id"))
+            section_creation_id = string_id(row.get("section_creation_id"))
+            if not course_creation_id or not section_creation_id:
+                continue
+            course_list.append(
+                {
+                    "COURSE_CREATION_ID": course_creation_id,
+                    "SECTION_CREATION_ID": section_creation_id,
+                    "CAMPUSNO": string_id(row.get("parent_campus_no") or campus_no),
+                }
+            )
+        for item in prepared:
+            course_list.append(
+                {
+                    "COURSE_CREATION_ID": item.target["course_creation_id"],
+                    "SECTION_CREATION_ID": string_id(item.target_section.get("section_creation_id")),
+                    "CAMPUSNO": string_id(item.add_state.get("campusno") or item.target["campus_id"]),
+                }
+            )
+        data = post_form_json(
+            prepared[0].session,
+            self.base_url,
+            "/Enlistment/GetCourseClashDetails/",
+            flatten_jquery_form({"academicSessionId": academic_session_id, "CourseList": course_list}),
+        )
+        normalized = normalize_value(data)
+        if not isinstance(normalized, list) or not normalized or not isinstance(normalized[0], dict):
+            raise RuntimeError("batch course clash response had an unexpected shape")
+        status = normalized[0].get("status")
+        if str(status) != "1":
+            raise RuntimeError(f"add/drop batch has a schedule clash or server warning: {status}")
+
+    def _add_class_batch_reflected(self, prepared: list[PreparedAddClass]) -> bool:
+        if not prepared:
+            return False
+        try:
+            state = get_add_drop_state(prepared[0].session, self.base_url, prepared[0].target["academic_session_id"])
+            for item in prepared:
+                current = find_current_enlisted_course(state, item.target["course_code"], item.target["course_creation_id"])
+                if string_id(current.get("section_creation_id")) != string_id(item.target_section.get("section_creation_id")):
+                    return False
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _find_add_course(add_state: dict[str, Any], course_code: str, course_creation_id: str) -> dict[str, Any] | None:

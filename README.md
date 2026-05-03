@@ -20,7 +20,7 @@ poetry run python -m archershub \
   --verbose
 ```
 
-The default auto-switch strategy is `drop-add`. The script still requires manual captcha entry at login.
+The default auto-switch strategy is `change-section`. Use `--switch-strategy drop-add` only when you intentionally want to spend the one-time ArchersHub add/drop application for that term/session. The script still requires manual captcha entry at login.
 By default it tries to solve the captcha with Tesseract OCR first, then falls back to manual entry if OCR fails.
 
 Install the Tesseract binary if it is not already available:
@@ -43,6 +43,12 @@ Optional reason IDs for Add/Drop, if required by ArchersHub:
 
 ```bash
 --add-reason-id 5 --drop-reason-id 3
+```
+
+For change-section reasons, use:
+
+```bash
+--change-reason-id 11
 ```
 
 ## Python endpoint client
@@ -102,7 +108,7 @@ poetry run python -m unittest discover -s tests_live -v
 - Do not commit ArchersHub credentials or live-test artifacts.
 - The endpoint client blocks mutation/payment calls unless explicitly enabled and confirmed.
 - The script stops once the target section is reflected or accepted by the server.
-- If a submit times out, it waits 10 seconds and checks server state before retrying.
+- If an add/drop submit times out or returns an unclear response, it waits 10 seconds and checks server state once, then stops instead of retrying so it does not create a second add/drop submission.
 
 ## Telegram notification service
 
@@ -165,17 +171,18 @@ poetry run archershub-admin set-interval 30
 
 ### User flow and commands
 
-After `/start <one-time-code>` and `/connect`, the bot shows a guided menu:
+After `/start`, the bot asks for a one-time registration code, then prompts the user to connect their ArchersHub account. `/start <one-time-code>` still works as a shortcut. Once connected, the bot shows a guided menu:
 
 - **Add a class**: for a course you are not enlisted in yet. The bot tries priority sections first, then safe fallback sections. It never drops or changes existing classes to resolve conflicts.
 - **Change section**: for a course you already have. The bot uses ArchersHub's change-section function only, never drop-add.
+- **Watch only**: notification-only monitoring when matching sections gain available slots. It never submits changes.
 
 Power-user commands remain available:
 
 - `/watch LCFAITH` notifies when any section of a course gains available slots.
 - `/watch LCFAITH Z18 Z19` notifies only when listed sections gain available slots.
 - `/addclass LCFAITH:Z18,Z19` creates an add-class automation job.
-- `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting.
+- `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting; pending add-class confirmations are submitted together as one add/drop batch.
 - `/change LCFAITH Z18` creates a change-section automation job.
 - `/jobs` lists watch/add/change jobs.
 - `/recheck` force-checks all active jobs immediately.
@@ -194,7 +201,7 @@ Mode behavior:
 - `confirm` records a pending action and waits for `/confirm JOB_ID`.
 - `auto` rechecks availability and submits immediately, then completes the job on success.
 
-Change-section jobs use the existing change-section flow. Add-class jobs use the add/drop add-course flow, try priority sections first, skip clashing sections, and then fall back to normalized section-name order without displacing existing classes.
+Change-section jobs use the existing change-section flow. Add-class jobs use the add/drop add-course flow, try priority sections first, skip clashing sections, and then fall back to normalized section-name order without displacing existing classes. When multiple auto add-class jobs for the same user and academic session become actionable in the same scheduler cycle, the bot submits them together in one add/drop payload.
 
 If an add-class job is for a course you already have, the bot converts it to a change-section job when priorities were supplied. If a course is visible in Course Finder but not currently add/change eligible in ArchersHub, the bot warns once and keeps checking.
 

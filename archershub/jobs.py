@@ -45,6 +45,12 @@ class AutomationCandidate:
     details: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class AutomationBatchResult:
+    submitted_job_ids: list[int]
+    message: str
+
+
 def choose_add_class_section(
     course_data: Any,
     *,

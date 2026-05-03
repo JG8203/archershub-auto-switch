@@ -21,9 +21,6 @@ from .console import log
 from .constants import AutoSwitchSubmitError, CHANGE_SECTION_TYPE_ID
 from .sections import (
     extract_course_code,
-    fetch_course_data,
-    find_target_section,
-    is_section_open,
     normalize_section_name,
 )
 
@@ -336,29 +333,61 @@ def build_add_course_payload(
     target_section: dict[str, Any],
     add_reason_id: str,
 ) -> dict[str, Any]:
-    student_id = state.get("student_id") or add_course.get("student_id") or "0"
-    row = with_student_id(add_course, student_id)
-    new_section_id = string_id(target_section.get("section_creation_id"))
-    if not new_section_id:
-        raise RuntimeError("target section id is missing")
+    return build_add_courses_payload(
+        state=state,
+        additions=[(add_course, target_section)],
+        add_reason_id=add_reason_id,
+    )
 
-    add_item = build_course_selection_item(row, section_creation_id=new_section_id, active=1)
-    missing = [
-        name
-        for name, value in {
-            "course creation id": add_item["COURSE_CREATION_ID"],
-            "enrollment semester id": add_item["ENROLLMENT_SEMESTER_ID"],
-            "curriculum creation id": add_item["CURRICULUM_CREATION_ID"],
-            "course category id": add_item["COURSE_CATEGORY_ID"],
-        }.items()
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"missing required add-course fields: {', '.join(missing)}")
+
+def build_add_courses_payload(
+    *,
+    state: dict[str, Any],
+    additions: list[tuple[dict[str, Any], dict[str, Any]]],
+    add_reason_id: str,
+) -> dict[str, Any]:
+    """Build one add/drop add-course payload for one or more course additions.
+
+    ArchersHub's add/drop application is represented as one enlistment payload
+    with a CourseSelectionList. When multiple add-class jobs are submitted
+    together, every requested add should be included in that single list instead
+    of making separate add/drop submissions.
+    """
+    if not additions:
+        raise RuntimeError("at least one add-course item is required")
+
+    course_items: list[dict[str, Any]] = []
+    additional_details: list[dict[str, Any]] = []
+    added_credits = 0.0
+
+    for add_course, target_section in additions:
+        student_id = state.get("student_id") or add_course.get("student_id") or "0"
+        row = with_student_id(add_course, student_id)
+        new_section_id = string_id(target_section.get("section_creation_id"))
+        if not new_section_id:
+            raise RuntimeError("target section id is missing")
+
+        add_item = build_course_selection_item(row, section_creation_id=new_section_id, active=1)
+        missing = [
+            name
+            for name, value in {
+                "course creation id": add_item["COURSE_CREATION_ID"],
+                "enrollment semester id": add_item["ENROLLMENT_SEMESTER_ID"],
+                "curriculum creation id": add_item["CURRICULUM_CREATION_ID"],
+                "course category id": add_item["COURSE_CATEGORY_ID"],
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(f"missing required add-course fields: {', '.join(missing)}")
+
+        if str(row.get("is_exclude", "0")) == "0":
+            added_credits += parse_number(row.get("credits"))
+        course_items.append(add_item)
+        additional_details.append(build_enlistment_additional_details(row, is_drop=False))
 
     enlisted_credits = current_enlisted_credits(state)
-    credits = parse_number(row.get("credits"))
-    unit = enlisted_credits if str(row.get("is_exclude", "0")) != "0" else enlisted_credits + credits
+    unit = enlisted_credits + added_credits
 
     max_credit = parse_number(state.get("max_credit")) + parse_number(state.get("max_credit_can_enroll"))
     if max_credit and unit > max_credit:
@@ -367,7 +396,7 @@ def build_add_course_payload(
     return {
         "ACADEMIC_SESSION_ID": string_id(state.get("academic_session_id")),
         "ACTIVE": 1,
-        "CourseSelectionList": [add_item],
+        "CourseSelectionList": course_items,
         "COMMAND_TYPE": "INSERT_UPDATE_STUDENT_ADD_DROP",
         "IS_ADD_REASON_ID": add_reason_id,
         "IS_DROP_REASON_ID": "0",
@@ -375,7 +404,7 @@ def build_add_course_payload(
         "IS_APPROVAL": string_id(state.get("is_approval") or "0"),
         "UNIT": f"{unit:g}",
         "IS_STUDENT_CONFIRMATION": string_id(state.get("is_student_confirmation") or "0"),
-        "EnlistmentAdditionalDetails": [build_enlistment_additional_details(row, is_drop=False)],
+        "EnlistmentAdditionalDetails": additional_details,
     }
 
 
@@ -757,55 +786,45 @@ def maybe_submit_drop_add_switch(
         "submitting automatic drop/add request "
         f"{target['course_code']} {current_section_id} -> {target_section_name} ({target_section_id})"
     )
-    while True:
+    try:
+        submit_add_drop(session, base_url, payload)
+        log("drop/add request accepted")
+        return True
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        log(
+            "drop/add submit did not return a clean response "
+            f"({exc}); waiting 10 seconds before checking server state"
+        )
+        time.sleep(10)
         try:
-            submit_add_drop(session, base_url, payload)
-            log("drop/add request accepted")
-            return True
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            log(
-                "drop/add submit did not return a clean response "
-                f"({exc}); waiting 10 seconds before checking server state"
-            )
-            time.sleep(10)
-
-            try:
-                if drop_add_switch_reflected(session, base_url, target, target_section_name):
-                    log(
-                        "drop/add submit appears successful after timeout; "
-                        f"{target['course_code']} is now in {target_section_name}"
-                    )
-                    return True
-            except Exception as verify_exc:
-                log(f"could not verify post-submit state yet: {verify_exc}")
-
-            try:
-                course_data = fetch_course_data(session, base_url, target)
-                refreshed_section = find_target_section(course_data, target_section_name)
-                if refreshed_section is None:
-                    log("target section disappeared after submit timeout; returning to normal polling")
-                    return False
-                if not is_section_open(refreshed_section):
-                    log("target section is no longer open after submit timeout; returning to normal polling")
-                    return False
-            except Exception as availability_exc:
-                log(f"could not recheck target availability after timeout: {availability_exc}")
-                return False
-
-            log("target section is still open and switch is not reflected yet; retrying submit")
-        except Exception as exc:
-            log(
-                "drop/add submit returned an error response "
-                f"({exc}); waiting 10 seconds before verifying server state"
-            )
-            time.sleep(10)
-            try:
-                if drop_add_switch_reflected(session, base_url, target, target_section_name):
-                    log(
-                        "drop/add switch is reflected despite the error response; "
-                        f"{target['course_code']} is now in {target_section_name}"
-                    )
-                    return True
-            except Exception as verify_exc:
-                log(f"could not verify post-error state: {verify_exc}")
-            raise
+            if drop_add_switch_reflected(session, base_url, target, target_section_name):
+                log(
+                    "drop/add submit appears successful after timeout; "
+                    f"{target['course_code']} is now in {target_section_name}"
+                )
+                return True
+        except Exception as verify_exc:
+            log(f"could not verify post-submit state yet: {verify_exc}")
+        raise AutoSwitchSubmitError(
+            "drop/add submit was attempted but could not be verified; "
+            "stopping to avoid a second add/drop submission"
+        ) from exc
+    except Exception as exc:
+        log(
+            "drop/add submit returned an error response "
+            f"({exc}); waiting 10 seconds before verifying server state"
+        )
+        time.sleep(10)
+        try:
+            if drop_add_switch_reflected(session, base_url, target, target_section_name):
+                log(
+                    "drop/add switch is reflected despite the error response; "
+                    f"{target['course_code']} is now in {target_section_name}"
+                )
+                return True
+        except Exception as verify_exc:
+            log(f"could not verify post-error state: {verify_exc}")
+        raise AutoSwitchSubmitError(
+            "drop/add submit was attempted but did not return a clean success; "
+            "stopping to avoid a second add/drop submission"
+        ) from exc

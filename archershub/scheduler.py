@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Awaitable, Callable
 
-from .jobs import AutomationCandidate, PermanentJobError
+from .constants import AutoSwitchSubmitError
+from .jobs import AutomationBatchResult, AutomationCandidate, PermanentJobError
 from .notifications import compact_sections, filter_sections, format_section_line
 from .storage import JOB_MODE_AUTO, JOB_MODE_CONFIRM, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, JobRecord, SQLiteStorage, dt_to_text, text_to_dt, utcnow
 
@@ -14,6 +15,8 @@ FetchCourse = Callable[[JobRecord], Awaitable[Any]]
 SendMessage = Callable[[int, str], Awaitable[None]]
 InspectAutomation = Callable[[JobRecord], Awaitable[AutomationCandidate | None]]
 ExecuteAutomation = Callable[[JobRecord], Awaitable[str]]
+ExecuteAutomationBatch = Callable[[list[JobRecord]], Awaitable[AutomationBatchResult]]
+AutomationBatch = list[tuple[JobRecord, AutomationCandidate]]
 
 
 @dataclass(frozen=True)
@@ -33,12 +36,14 @@ class WatchScheduler:
         send_message: SendMessage,
         inspect_automation: InspectAutomation | None = None,
         execute_automation: ExecuteAutomation | None = None,
+        execute_automation_batch: ExecuteAutomationBatch | None = None,
     ) -> None:
         self.storage = storage
         self.fetch_course = fetch_course
         self.send_message = send_message
         self.inspect_automation = inspect_automation
         self.execute_automation = execute_automation
+        self.execute_automation_batch = execute_automation_batch
         self._stopped = asyncio.Event()
 
     def stop(self) -> None:
@@ -67,8 +72,13 @@ class WatchScheduler:
         checked = 0
         sent = 0
         errors: list[str] = []
+        auto_add_batches: dict[tuple[int, str], AutomationBatch] = {}
 
         for job in jobs:
+            current = self.storage.get_job(job.id)
+            if current is None or not current.enabled or current.completed_at is not None or current.paused_at is not None:
+                continue
+            job = current
             if job.job_type not in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
                 continue
             if not ignore_backoff and self._is_backing_off(job):
@@ -79,7 +89,7 @@ class WatchScheduler:
                 if job.job_type == JOB_TYPE_WATCH:
                     sent += await self._process_watch_job(job)
                 else:
-                    sent += await self._process_automation_job(job)
+                    sent += await self._process_automation_job(job, auto_add_batches=auto_add_batches)
             except PermanentJobError as exc:
                 message = f"job {job.id}: {exc}"
                 logging.info("automation job stopped: %s", message)
@@ -91,11 +101,44 @@ class WatchScheduler:
                 if user:
                     await self.send_message(user.telegram_id, f"Job #{job.id} stopped.\n\n{exc}")
                     sent += 1
+            except AutoSwitchSubmitError as exc:
+                message = f"job {job.id}: {exc}"
+                logging.info("automation submit stopped: %s", message)
+                errors.append(message)
+                self.storage.record_job_success(job.id, action="stopped_after_submit", message=str(exc))
+                self.storage.complete_job(job.id)
+                user = self._user_for_job(job)
+                if user:
+                    await self.send_message(user.telegram_id, f"Job #{job.id} stopped after an add/drop or change-section submit attempt.\n\n{exc}")
+                    sent += 1
             except Exception as exc:  # keep one bad user/job from stopping the cycle
                 message = f"job {job.id}: {exc}"
                 logging.exception("automation scheduler failed for %s", message)
                 errors.append(message)
                 self._record_backoff(job, str(exc))
+
+        for batch in auto_add_batches.values():
+            try:
+                sent += await self._process_auto_add_batch(batch)
+            except AutoSwitchSubmitError as exc:
+                job_ids = ",".join(str(job.id) for job, _candidate in batch)
+                message = f"add/drop batch jobs {job_ids}: {exc}"
+                logging.info("automation submit stopped: %s", message)
+                errors.append(message)
+                user = self._user_for_job(batch[0][0]) if batch else None
+                for job, _candidate in batch:
+                    self.storage.record_job_success(job.id, action="stopped_after_submit", message=str(exc))
+                    self.storage.complete_job(job.id)
+                if user:
+                    await self.send_message(user.telegram_id, f"Add/drop batch stopped after a submit attempt.\n\n{exc}")
+                    sent += 1
+            except Exception as exc:
+                job_ids = ",".join(str(job.id) for job, _candidate in batch)
+                message = f"add/drop batch jobs {job_ids}: {exc}"
+                logging.exception("automation scheduler failed for %s", message)
+                errors.append(message)
+                for job, _candidate in batch:
+                    self._record_backoff(job, str(exc))
 
         return SchedulerCycleResult(checked, sent, errors)
 
@@ -142,7 +185,7 @@ class WatchScheduler:
                 openings.append(row)
         return openings
 
-    async def _process_automation_job(self, job: JobRecord) -> int:
+    async def _process_automation_job(self, job: JobRecord, *, auto_add_batches: dict[tuple[int, str], AutomationBatch] | None = None) -> int:
         if self.inspect_automation is None:
             return 0
         candidate = await self.inspect_automation(job)
@@ -164,6 +207,15 @@ class WatchScheduler:
             return 1
 
         if job.mode == JOB_MODE_AUTO:
+            if (
+                job.job_type == JOB_TYPE_ADD_CLASS
+                and candidate.action == "add_class"
+                and self.execute_automation_batch is not None
+                and auto_add_batches is not None
+            ):
+                batch_key = (user.id, str(candidate.details.get("academic_session_id") or ""))
+                auto_add_batches.setdefault(batch_key, []).append((job, candidate))
+                return 0
             if self.execute_automation is None:
                 return 0
             result = await self.execute_automation(job)
@@ -198,6 +250,35 @@ class WatchScheduler:
         self.storage.set_snapshot(alert_snapshot_key, candidate.dedupe_key)
         await self.send_message(user.telegram_id, self._format_notify_message(job, candidate))
         self.storage.record_job_success(job.id, action="notify", message=f"notified for {candidate.target_section_name or '-'}")
+        return 1
+
+    async def _process_auto_add_batch(self, batch: AutomationBatch) -> int:
+        if self.execute_automation_batch is None:
+            return 0
+        active_batch: AutomationBatch = []
+        for job, candidate in batch:
+            current = self.storage.get_job(job.id)
+            if current is None or not current.enabled or current.completed_at is not None or current.paused_at is not None:
+                continue
+            active_batch.append((current, candidate))
+        if not active_batch:
+            return 0
+        jobs = [job for job, _candidate in active_batch]
+        user = self._user_for_job(jobs[0])
+        if user is None:
+            return 0
+        result = await self.execute_automation_batch(jobs)
+        submitted = set(result.submitted_job_ids)
+        if not submitted:
+            return 0
+        for job, candidate in active_batch:
+            if job.id not in submitted:
+                continue
+            self.storage.complete_job(job.id)
+            self.storage.record_job_success(job.id, action=f"{candidate.action}_batch", message=result.message)
+            self.storage.delete_snapshot(f"job:{job.id}:automation-alert")
+            self.storage.clear_pending_action(job.id)
+        await self.send_message(user.telegram_id, result.message)
         return 1
 
     @staticmethod

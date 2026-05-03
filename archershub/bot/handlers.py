@@ -5,6 +5,7 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
+from ..constants import AutoSwitchSubmitError
 from ..scheduler import WatchScheduler
 from ..sections import normalize_section_name
 from ..storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, SQLiteStorage
@@ -12,7 +13,17 @@ from .messages import delete_message_safely
 from .parsing import MODE_VALUES, parse_addclass_specs
 from .service import BotArchersHubService, TelegramCaptchaRequired
 
-ASK_USERNAME, ASK_PASSWORD, ASK_ADD_COURSE, ASK_ADD_PRIORITIES, ASK_CHANGE_COURSE, ASK_CHANGE_SECTION = range(6)
+(
+    ASK_REGISTRATION_CODE,
+    ASK_USERNAME,
+    ASK_PASSWORD,
+    ASK_ADD_COURSE,
+    ASK_ADD_PRIORITIES,
+    ASK_CHANGE_COURSE,
+    ASK_CHANGE_SECTION,
+    ASK_WATCH_COURSE,
+    ASK_WATCH_SECTIONS,
+) = range(9)
 
 
 class TelegramControlPanel:
@@ -23,7 +34,15 @@ class TelegramControlPanel:
 
     def build_handlers(self):
         return [
-            CommandHandler("start", self.start),
+            ConversationHandler(
+                entry_points=[CommandHandler("start", self.start)],
+                states={
+                    ASK_REGISTRATION_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_registration_code)],
+                },
+                fallbacks=[CommandHandler("cancel", self.cancel)],
+                name="register_telegram",
+                persistent=False,
+            ),
             ConversationHandler(
                 entry_points=[CommandHandler("connect", self.connect), CallbackQueryHandler(self.connect, pattern="^connect$")],
                 states={
@@ -54,6 +73,16 @@ class TelegramControlPanel:
                 name="change_section_wizard",
                 persistent=False,
             ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(self.begin_watch_wizard, pattern="^menu:watch$")],
+                states={
+                    ASK_WATCH_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_course)],
+                    ASK_WATCH_SECTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_sections)],
+                },
+                fallbacks=[CommandHandler("cancel", self.cancel)],
+                name="watch_only_wizard",
+                persistent=False,
+            ),
             CommandHandler("help", self.help),
             CommandHandler("watch", self.watch),
             CommandHandler("change", self.change_section_job),
@@ -68,6 +97,7 @@ class TelegramControlPanel:
             CommandHandler("remove", self.remove),
             CommandHandler("cancel", self.cancel),
             CallbackQueryHandler(self.menu_callback, pattern="^menu:(jobs|help)$"),
+            MessageHandler(filters.COMMAND, self.unknown_command),
         ]
 
     @staticmethod
@@ -76,6 +106,7 @@ class TelegramControlPanel:
             [
                 [InlineKeyboardButton("➕ Add a class", callback_data="menu:add")],
                 [InlineKeyboardButton("🔁 Change section", callback_data="menu:change")],
+                [InlineKeyboardButton("👀 Watch only", callback_data="menu:watch")],
                 [InlineKeyboardButton("📋 My jobs", callback_data="menu:jobs"), InlineKeyboardButton("❓ Help", callback_data="menu:help")],
             ]
         )
@@ -88,37 +119,50 @@ class TelegramControlPanel:
             "I will try open sections in your priority order, then safe fallback sections. "
             "I will not drop or change existing classes to make room.\n\n"
             "🔁 Change section: use this when you already have the class and only want a different section. "
-            "This uses ArchersHub's change-section function only, never drop-add."
+            "This uses ArchersHub's change-section function only, never drop-add.\n\n"
+            "👀 Watch only: get notified when sections open without submitting anything."
         )
 
-    async def start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    @staticmethod
+    def connect_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("Connect ArchersHub", callback_data="connect")]])
+
+    async def start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         chat = update.effective_chat
         if chat is None or update.effective_user is None:
-            return
+            return ConversationHandler.END
         existing = self.storage.get_user_by_telegram_id(chat.id)
         if existing:
-            await update.effective_message.reply_text(
-                "You are registered. Use /connect to update your ArchersHub login, or choose what to do next.",
-                reply_markup=self.main_menu_markup(),
-            )
-            return
+            await self._reply_registered_home(update, existing)
+            return ConversationHandler.END
         if not ctx.args:
             await update.effective_message.reply_text(
-                "Welcome! Register first with your one-time code:\n\n"
-                "/start YOUR_CODE\n\n"
+                "Welcome! Please send your one-time registration code.\n\n"
                 "Ask the service admin for a code if you do not have one yet."
             )
-            return
+            return ASK_REGISTRATION_CODE
+        await self._redeem_registration_code(update, ctx.args[0])
+        return ConversationHandler.END
+
+    async def received_registration_code(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        registered = await self._redeem_registration_code(update, update.effective_message.text.strip())
+        return ConversationHandler.END if registered else ASK_REGISTRATION_CODE
+
+    async def _redeem_registration_code(self, update: Update, code: str) -> bool:
+        chat = update.effective_chat
+        if chat is None or update.effective_user is None:
+            return False
         try:
-            user = self.storage.redeem_registration_code(ctx.args[0], chat.id, update.effective_user.username)
+            user = self.storage.redeem_registration_code(code, chat.id, update.effective_user.username)
         except ValueError as exc:
-            await update.effective_message.reply_text(f"Registration failed: {exc}")
-            return
+            await update.effective_message.reply_text(f"Registration failed: {exc}\n\nSend another code, or use /cancel to stop.")
+            return False
         await update.effective_message.reply_text(
             "Registration complete. Next, connect your ArchersHub account so I can check sections for you.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Connect ArchersHub", callback_data="connect")]]),
+            reply_markup=self.connect_markup(),
         )
         logging.info("registered telegram_id=%s as user_id=%s", chat.id, user.id)
+        return True
 
     async def help(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(self.help_text(), reply_markup=self.main_menu_markup())
@@ -130,7 +174,7 @@ class TelegramControlPanel:
             "Create jobs:\n"
             "• /watch LCFAITH Z18 Z19 — notify when matching sections get slots.\n"
             "• /addclass LCFAITH:Z18,Z19 — add a class you do not have yet. Priorities are optional.\n"
-            "• /addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm — add multiple classes and ask before submitting.\n"
+            "• /addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm — add multiple classes and submit pending adds as one add/drop batch.\n"
             "• /change LCFAITH Z18 — change an existing class to section Z18.\n\n"
             "Difference:\n"
             "• Add class never drops/changes your current classes to solve conflicts.\n"
@@ -144,7 +188,7 @@ class TelegramControlPanel:
             "• /setpriorities 12 Z18 Z19 — edit add-class priority sections.\n"
             "• /retarget 13 Z20 — edit a change-section target.\n\n"
             "Confirm mode:\n"
-            "• /confirm 12 — recheck and submit a pending request.\n"
+            "• /confirm 12 — recheck and submit a pending request. Pending add-class requests are batched together.\n"
             "• /reject 12 — clear a pending request.\n\n"
             "Modes: auto submits when safe, confirm asks first, notify only alerts."
         )
@@ -162,10 +206,13 @@ class TelegramControlPanel:
         if update.callback_query:
             await update.callback_query.answer()
         if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return ConversationHandler.END
         ctx.user_data.clear()
-        await update.effective_message.reply_text("Send your ArchersHub username/email. Use /cancel to stop.")
+        await update.effective_message.reply_text(
+            "Send your ArchersHub username/email. Use /cancel to stop.\n\n"
+            "I will store your login encrypted and use it only to check or submit your jobs."
+        )
         return ASK_USERNAME
 
     async def received_username(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -202,8 +249,12 @@ class TelegramControlPanel:
 
     async def begin_add_wizard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
-        if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start <code>.")
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start.")
+            return ConversationHandler.END
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
             return ConversationHandler.END
         ctx.user_data.clear()
         await update.effective_message.reply_text(
@@ -224,7 +275,7 @@ class TelegramControlPanel:
     async def received_add_priorities(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return ConversationHandler.END
         text = update.effective_message.text.strip()
         priorities = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
@@ -241,8 +292,12 @@ class TelegramControlPanel:
 
     async def begin_change_wizard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
-        if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start <code>.")
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start.")
+            return ConversationHandler.END
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
             return ConversationHandler.END
         ctx.user_data.clear()
         await update.effective_message.reply_text(
@@ -261,7 +316,7 @@ class TelegramControlPanel:
     async def received_change_section(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return ConversationHandler.END
         target = normalize_section_name(update.effective_message.text.strip())
         job = self.storage.add_job(
@@ -278,7 +333,10 @@ class TelegramControlPanel:
     async def change_section_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
+            return
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
             return
         if len(ctx.args) < 2:
             await update.effective_message.reply_text(
@@ -300,7 +358,10 @@ class TelegramControlPanel:
     async def add_class_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
+            return
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
             return
         if not ctx.args:
             await update.effective_message.reply_text(
@@ -331,7 +392,10 @@ class TelegramControlPanel:
     async def watch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
+            return
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
             return
         if not ctx.args:
             await update.effective_message.reply_text(
@@ -352,8 +416,57 @@ class TelegramControlPanel:
         target = "all sections" if not sections else ", ".join(sections)
         await update.effective_message.reply_text(
             f"Saved watch job #{job.id} for {job.course_code}: {target}.\n"
-            "I will only notify when matching sections gain available slots."
+            "I will only notify when matching sections gain available slots.",
+            reply_markup=self.main_menu_markup(),
         )
+
+    async def begin_watch_wizard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        await update.callback_query.answer()
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start.")
+            return ConversationHandler.END
+        if not self._has_credentials(user.id):
+            await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
+            return ConversationHandler.END
+        ctx.user_data.clear()
+        await update.effective_message.reply_text(
+            "Watch only\n\n"
+            "I will notify you when matching sections get slots. I will not submit anything.\n\n"
+            "Send the course code, e.g. LCFAITH."
+        )
+        return ASK_WATCH_COURSE
+
+    async def received_watch_course(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        ctx.user_data["watch_course_code"] = update.effective_message.text.strip().upper()
+        await update.effective_message.reply_text(
+            "Optional: send sections to watch separated by spaces or commas, e.g. Z18 Z19.\n"
+            "Send '-' to watch all sections."
+        )
+        return ASK_WATCH_SECTIONS
+
+    async def received_watch_sections(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start.")
+            return ConversationHandler.END
+        text = update.effective_message.text.strip()
+        sections = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
+        job = self.storage.add_job(
+            user_id=user.id,
+            job_type=JOB_TYPE_WATCH,
+            mode=JOB_MODE_NOTIFY,
+            course_code=ctx.user_data.get("watch_course_code", ""),
+            section_filters=sections,
+        )
+        ctx.user_data.clear()
+        target = "all sections" if not sections else ", ".join(sections)
+        await update.effective_message.reply_text(
+            f"Saved watch job #{job.id} for {job.course_code}: {target}.\n"
+            "I will only notify when matching sections gain available slots.",
+            reply_markup=self.main_menu_markup(),
+        )
+        return ConversationHandler.END
 
     async def set_mode(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         job = await self._owned_job_or_reply(update, ctx, usage="Usage: /setmode JOB_ID notify|confirm|auto\nExample: /setmode 12 confirm")
@@ -393,7 +506,7 @@ class TelegramControlPanel:
     async def jobs(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return
         jobs = [
             job
@@ -431,7 +544,7 @@ class TelegramControlPanel:
     async def recheck(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return
         if self.scheduler is None:
             await update.effective_message.reply_text("Recheck is unavailable because the background scheduler is not running.")
@@ -456,7 +569,7 @@ class TelegramControlPanel:
     async def confirm_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /confirm JOB_ID\nExample: /confirm 12")
@@ -471,19 +584,53 @@ class TelegramControlPanel:
             await update.effective_message.reply_text("That job does not have a pending confirmation request.")
             return
         status = await update.effective_message.reply_text("Rechecking availability and submitting now...")
+        batch_jobs = [job]
         try:
-            message = await self.archershub.execute_automation_job(job)
+            if job.job_type == JOB_TYPE_ADD_CLASS and pending.action_type == "add_class":
+                batch_jobs = []
+                for candidate in self.storage.list_jobs(user_id=user.id):
+                    if (
+                        candidate.job_type != JOB_TYPE_ADD_CLASS
+                        or not candidate.enabled
+                        or candidate.completed_at is not None
+                        or candidate.paused_at is not None
+                    ):
+                        continue
+                    candidate_pending = self.storage.get_pending_action(candidate.id)
+                    if candidate_pending and candidate_pending.action_type == "add_class":
+                        batch_jobs.append(candidate)
+                result = await self.archershub.execute_automation_batch(batch_jobs)
+                submitted = set(result.submitted_job_ids)
+                for batch_job in batch_jobs:
+                    if batch_job.id in submitted:
+                        self.storage.complete_job(batch_job.id)
+                message = result.message
+            else:
+                message = await self.archershub.execute_automation_job(job)
+                self.storage.complete_job(job_id)
+        except AutoSwitchSubmitError as exc:
+            for batch_job in batch_jobs:
+                self.storage.complete_job(batch_job.id)
+            await status.edit_text(
+                "Submit was attempted, but the result was unclear. "
+                "I stopped the job to avoid a duplicate add/drop or change-section submission.\n\n"
+                f"{exc}"
+            )
+            return
         except Exception as exc:
-            self.storage.clear_pending_action(job_id)
+            if job.job_type == JOB_TYPE_ADD_CLASS:
+                for pending_job in batch_jobs:
+                    self.storage.clear_pending_action(pending_job.id)
+            else:
+                self.storage.clear_pending_action(job_id)
             await status.edit_text(f"Confirmation failed: {exc}")
             return
-        self.storage.complete_job(job_id)
         await status.edit_text(message)
 
     async def reject_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /reject JOB_ID\nExample: /reject 12")
@@ -498,7 +645,7 @@ class TelegramControlPanel:
 
     async def remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /remove JOB_ID\nExample: /remove 12")
@@ -510,10 +657,37 @@ class TelegramControlPanel:
         chat = update.effective_chat
         return self.storage.get_user_by_telegram_id(chat.id) if chat else None
 
+    def _has_credentials(self, user_id: int) -> bool:
+        return self.storage.get_credentials(user_id) is not None
+
+    async def _reply_registered_home(self, update: Update, user) -> None:
+        if self._has_credentials(user.id):
+            await update.effective_message.reply_text(self.onboarding_text(), reply_markup=self.main_menu_markup())
+            return
+        await update.effective_message.reply_text(
+            "You are registered. Next, connect your ArchersHub account so I can check sections for you.",
+            reply_markup=self.connect_markup(),
+        )
+
+    async def unknown_command(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        user = self._registered(update)
+        if user and self._has_credentials(user.id):
+            await update.effective_message.reply_text(
+                "command not recognized. Use /help or choose an option below.",
+                reply_markup=self.main_menu_markup(),
+            )
+        elif user:
+            await update.effective_message.reply_text(
+                "command not recognized. Connect your ArchersHub account first.",
+                reply_markup=self.connect_markup(),
+            )
+        else:
+            await update.effective_message.reply_text("command not recognized. Use /start to register.")
+
     async def _owned_job_or_reply(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, usage: str):
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start <code>.")
+            await update.effective_message.reply_text("Register first with /start.")
             return None
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text(usage)

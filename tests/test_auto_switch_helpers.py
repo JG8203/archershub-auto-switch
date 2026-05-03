@@ -1,7 +1,10 @@
 import unittest
+from unittest.mock import patch
+
+import requests
 
 from archershub.auth import looks_like_captcha, sanitize_captcha_text
-from archershub.constants import CHANGE_SECTION_TYPE_ID
+from archershub.constants import AutoSwitchSubmitError, CHANGE_SECTION_TYPE_ID
 from archershub.sections import (
     available_slots,
     effective_capacity,
@@ -9,8 +12,10 @@ from archershub.sections import (
     is_section_open,
 )
 from archershub.switching import (
+    build_add_courses_payload,
     build_change_section_payload,
     build_drop_add_payload,
+    maybe_submit_drop_add_switch,
     resolve_add_drop_reason,
     resolve_change_reason,
 )
@@ -133,6 +138,96 @@ class AutoSwitchHelperTests(unittest.TestCase):
             [(row["SECTION_CREATION_ID"], row["ACTIVE"]) for row in payload["CourseSelectionList"]],
             [("671", 2), ("900", 1)],
         )
+
+    def test_build_add_courses_payload_batches_multiple_adds(self):
+        state = {
+            "academic_session_id": 135,
+            "student_id": 37777,
+            "get_enlisted_subject": [
+                {"credits": 3, "is_exclude": 0},
+                {"credits": 3, "is_exclude": 0},
+            ],
+            "max_credit": 20,
+            "max_credit_can_enroll": 0,
+            "is_approval": 0,
+            "is_student_confirmation": 0,
+        }
+        base_add_course = {
+            "enrollment_semester_id": 43,
+            "regular_restudy": 0,
+            "curriculum_creation_id": 485,
+            "course_category_id": 1,
+            "credits": 3,
+            "is_exclude": 0,
+            "is_mandatory": 0,
+            "pre_requisite_status": 0,
+        }
+        payload = build_add_courses_payload(
+            state=state,
+            additions=[
+                ({**base_add_course, "course_creation_id": 1924}, {"section_creation_id": 900}),
+                ({**base_add_course, "course_creation_id": 1925}, {"section_creation_id": 901}),
+            ],
+            add_reason_id="5",
+        )
+        self.assertEqual(payload["COMMAND_TYPE"], "INSERT_UPDATE_STUDENT_ADD_DROP")
+        self.assertEqual(payload["IS_ADD_REASON_ID"], "5")
+        self.assertEqual(payload["IS_DROP_REASON_ID"], "0")
+        self.assertEqual(payload["UNIT"], "12")
+        self.assertEqual(
+            [row["SECTION_CREATION_ID"] for row in payload["CourseSelectionList"]],
+            ["900", "901"],
+        )
+        self.assertEqual(len(payload["EnlistmentAdditionalDetails"]), 2)
+
+    def test_drop_add_submit_is_not_retried_after_timeout(self):
+        state = {
+            "student_id": 37777,
+            "campusno": "1",
+            "drop_registered_course_list": [
+                {
+                    "course_creation_id": "1924",
+                    "section_creation_id": "671",
+                    "enrollment_semester_id": "43",
+                    "regular_restudy": "0",
+                    "curriculum_creation_id": "485",
+                    "course_category_id": "1",
+                    "credits": "3",
+                    "is_exclude": "0",
+                    "is_mandatory": "0",
+                }
+            ],
+            "get_enlisted_subject": [{"course_creation_id": "1924", "section_creation_id": "671", "credits": 3, "is_exclude": 0}],
+            "min_credit": 0,
+            "max_credit": 20,
+            "max_credit_can_enroll": 0,
+            "is_approval": 0,
+            "is_student_confirmation": 0,
+            "is_mandatory": 0,
+        }
+        target = {
+            "course_code": "LCFAITH",
+            "course_creation_id": "1924",
+            "academic_session_id": "135",
+            "campus_id": "1",
+            "is_cross_offer": "0",
+            "grid_type": "0",
+        }
+        with patch("archershub.switching.get_add_drop_state", return_value=state), \
+            patch("archershub.switching.get_course_wise_section_data", return_value={"section_details": [{"section_creation_id": "900"}]}), \
+            patch("archershub.switching.post_form_json", return_value=[{"status": "1"}]), \
+            patch("archershub.switching.drop_add_switch_reflected", return_value=False), \
+            patch("archershub.switching.time.sleep"), \
+            patch("archershub.switching.submit_add_drop", side_effect=requests.exceptions.Timeout("slow")) as submit:
+            with self.assertRaises(AutoSwitchSubmitError):
+                maybe_submit_drop_add_switch(
+                    object(),
+                    "https://example.test",
+                    target,
+                    "C02",
+                    {"section_creation_id": "900"},
+                )
+        self.assertEqual(submit.call_count, 1)
 
     def test_resolve_add_drop_reason(self):
         data = {
