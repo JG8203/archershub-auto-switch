@@ -30,6 +30,28 @@ class CourseSearchHelperTests(unittest.TestCase):
         sections = [{"course_creation_id": 10, "section_creation_id": 1, "section_name": "Z18", "main_teacher": "-"}]
         self.assertEqual(merge_revealed_teachers(sections, None), sections)
 
+    def test_teacher_reveal_sanitizes_html_course_name_rows(self):
+        sections = [
+            {"course_creation_id": 10, "section_creation_id": 633, "batch_creation_id": 0, "section_name": "V01", "main_teacher": "-"},
+        ]
+        schedule_rows = [
+            {
+                "COURSE_CREATION_ID": 0,
+                "SECTION_CREATION_ID": 0,
+                "BATCH_CREATION_ID": 0,
+                "COURSE_NAME": (
+                    "<span>INTRODUCTION TO ANALYTICS</span>"
+                    "<span>Teacher : Wilson n.a. Cordova<script>alert(1)</script></span>"
+                    "<span>Section : V01</span>"
+                ),
+            }
+        ]
+
+        merged = merge_revealed_teachers(sections, schedule_rows)
+
+        self.assertEqual(merged[0]["main_teacher"], "Wilson n.a. Cordova")
+        self.assertNotIn("<script", merged[0]["main_teacher"])
+
 
 if __name__ == "__main__":
     unittest.main()

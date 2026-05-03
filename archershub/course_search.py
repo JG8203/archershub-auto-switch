@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import html
+import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 from .api import flatten_jquery_form, normalize_value, parse_number, post_form_json, string_id, value_to_string
+from .constants import TIMEOUT
 from .sections import (
     available_slots,
     current_session_id,
@@ -172,25 +178,180 @@ def teacher_from_row(row: dict[str, Any]) -> str:
     return ""
 
 
+def clean_teacher_text(value: str) -> str:
+    text = html.unescape(value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" :-–—|")
+    if not text or text == "-":
+        return ""
+    return text
+
+
+def plain_html_text(value: str) -> str:
+    soup = BeautifulSoup(value, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return clean_teacher_text(soup.get_text("\n"))
+
+
+def html_text_lines(value: str) -> list[str]:
+    soup = BeautifulSoup(value, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return [clean_teacher_text(line) for line in soup.get_text("\n").splitlines() if clean_teacher_text(line)]
+
+
+TEACHER_LABEL_RE = re.compile(
+    r"(?:main\s*)?(?:teacher|faculty|instructor)(?:\s*name)?\s*[:\-–—]\s*([^\n\r|<>{}\\[\\]]+)",
+    re.IGNORECASE,
+)
+TEACHER_ICON_RE = re.compile(r"(?:👤|&#128100;|&[#a-zA-Z0-9]+;)\s*([A-Z][^\n\r|<>{}\\[\\]]{2,80})")
+SECTION_LABEL_RE = re.compile(r"section\s*[:\-–—]\s*([^\n\r|<>{}\\[\\]]+)", re.IGNORECASE)
+
+
+def extract_labeled_value(value: str, label: str) -> str:
+    label_re = re.compile(rf"^{re.escape(label)}\s*[:\-–—]\s*(.+)$", re.IGNORECASE)
+    for line in html_text_lines(value):
+        match = label_re.search(line)
+        if match:
+            return clean_teacher_text(match.group(1))
+    return ""
+
+
+def extract_teacher_from_text(value: str) -> str:
+    teacher = extract_labeled_value(value, "Teacher") or extract_labeled_value(value, "Main Teacher")
+    if teacher:
+        return teacher
+    text = plain_html_text(value)
+    for regex in (TEACHER_LABEL_RE, TEACHER_ICON_RE):
+        match = regex.search(text)
+        if match:
+            teacher = clean_teacher_text(match.group(1))
+            if teacher:
+                return teacher
+    return ""
+
+
+def extract_section_from_text(value: str) -> str:
+    section = extract_labeled_value(value, "Section")
+    if section:
+        return normalize_section_name(section)
+    text = plain_html_text(value)
+    match = SECTION_LABEL_RE.search(text)
+    return normalize_section_name(match.group(1)) if match else ""
+
+
+def schedule_rows_from_html(value: str, sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract teacher names from the HTML form of CourseFinder/GetScheduleData.
+
+    The endpoint has been observed returning markup instead of JSON. Treat all
+    markup as untrusted display text: strip active content, only keep text, and
+    match teacher labels/icons near the selected section's identifiers/name.
+    """
+
+    soup = BeautifulSoup(value, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    rows: list[dict[str, Any]] = []
+    full_text = soup.get_text("\n")
+    for section in sections:
+        course_id, section_id, batch_id = section_key(section)
+        section_name = normalize_section_name(section.get("section_name"))
+        candidates: list[str] = []
+
+        for attr_value in (section_id, section_name):
+            if not attr_value:
+                continue
+            found = soup.find_all(string=re.compile(re.escape(attr_value), re.IGNORECASE))
+            for node in found:
+                parent = getattr(node, "parent", None)
+                for _ in range(4):
+                    if parent is None:
+                        break
+                    text = parent.get_text("\n", strip=True)
+                    if text:
+                        candidates.append(text)
+                    parent = parent.parent
+
+        for marker in (section_id, section_name):
+            if not marker:
+                continue
+            for match in re.finditer(re.escape(marker), full_text, re.IGNORECASE):
+                start = max(0, match.start() - 600)
+                end = min(len(full_text), match.end() + 900)
+                candidates.append(full_text[start:end])
+
+        teacher = ""
+        for candidate in candidates:
+            teacher = extract_teacher_from_text(candidate)
+            if teacher:
+                break
+        if teacher:
+            rows.append(
+                {
+                    "course_creation_id": course_id,
+                    "section_creation_id": section_id,
+                    "batch_creation_id": batch_id,
+                    "main_teacher": teacher,
+                }
+            )
+    return rows
+
+
+def normalize_schedule_response(value: Any, sections: list[dict[str, Any]]) -> Any:
+    if isinstance(value, (list, dict)):
+        return normalize_value(value)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return []
+    try:
+        return normalize_value(json.loads(text))
+    except ValueError:
+        pass
+    return schedule_rows_from_html(text, sections)
+
+
+def schedule_row_teacher(row: dict[str, Any]) -> str:
+    return teacher_from_row(row) or extract_teacher_from_text(str(row.get("course_name") or ""))
+
+
+def schedule_row_section_name(row: dict[str, Any]) -> str:
+    return normalize_section_name(row.get("section_name")) or extract_section_from_text(str(row.get("course_name") or ""))
+
+
 def merge_revealed_teachers(sections: list[dict[str, Any]], schedule_rows: Any) -> list[dict[str, Any]]:
+    schedule_rows = normalize_schedule_response(schedule_rows, sections)
     if not isinstance(schedule_rows, list):
         return sections
     teachers: dict[tuple[str, str, str], str] = {}
+    teachers_by_section_name: dict[str, str] = {}
     for row in schedule_rows:
         if not isinstance(row, dict):
             continue
         normalized = normalize_value(row)
         if not isinstance(normalized, dict):
             continue
-        teacher = teacher_from_row(normalized)
+        teacher = schedule_row_teacher(normalized)
         if teacher:
             teachers.setdefault(section_key(normalized), teacher)
+            section_name = schedule_row_section_name(normalized)
+            if section_name:
+                teachers_by_section_name.setdefault(section_name, teacher)
     if not teachers:
+        if not teachers_by_section_name:
+            return sections
+    if not teachers and not teachers_by_section_name:
         return sections
     merged: list[dict[str, Any]] = []
     for section in sections:
         updated = dict(section)
-        teacher = teachers.get(section_key(updated))
+        teacher = teachers.get(section_key(updated)) or teachers_by_section_name.get(normalize_section_name(updated.get("section_name")))
         current = teacher_from_row(updated)
         if teacher and not current:
             updated["main_teacher"] = teacher
@@ -248,11 +409,9 @@ def reveal_teachers_with_schedule_data(
         )
     if not enlistment_schedule:
         return sections
-    data = post_form_json(
-        session,
-        base_url,
-        "/CourseFinder/GetScheduleData/",
-        flatten_jquery_form(
+    response = session.post(
+        urljoin(base_url.rstrip("/") + "/", "CourseFinder/GetScheduleData/"),
+        data=flatten_jquery_form(
             {
                 "STARTDATE": start_date,
                 "ENDDATE": end_date,
@@ -260,8 +419,17 @@ def reveal_teachers_with_schedule_data(
                 "enlistmentSchedule": enlistment_schedule,
             }
         ),
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        timeout=TIMEOUT,
     )
-    return merge_revealed_teachers(sections, normalize_value(data))
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "").lower()
+    data: Any
+    if "json" in content_type:
+        data = response.json()
+    else:
+        data = response.text
+    return merge_revealed_teachers(sections, data)
 
 
 def section_summary(section: dict[str, Any]) -> dict[str, Any]:
