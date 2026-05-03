@@ -71,6 +71,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             panel = TelegramControlPanel(SQLiteStorage(f"{tmp}/bot.sqlite3"), AsyncMock())
             commands = command_names(panel.build_handlers())
             self.assertIn("watch", commands)
+            self.assertIn("login", commands)
             self.assertNotIn("summary", commands)
             self.assertNotIn("checknow", commands)
             self.assertIn("cancel", commands)
@@ -80,6 +81,21 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("change-section feature, never drop-add", text)
             self.assertIn("/recheck", text)
             self.assertIn("/watch", text)
+            self.assertIn("/login", text)
+
+    async def test_login_command_uses_connect_flow_for_relogin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 112, "tester")
+            save_dummy_credentials(storage, user.id)
+            panel = TelegramControlPanel(storage, AsyncMock())
+            update = fake_update(user.telegram_id)
+            ctx = SimpleNamespace(user_data={"old": "value"})
+
+            await panel.connect(update, ctx)
+
+            self.assertEqual(ctx.user_data, {})
+            self.assertIn("replace any saved ArchersHub login", update.effective_message.replies[0][0])
 
     async def test_start_without_code_prompts_for_registration_code(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,6 +167,24 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             markup = update.effective_message.replies[0][1]
             labels = [button.text for row in markup.inline_keyboard for button in row]
             self.assertIn("👀 Watch only", labels)
+
+    async def test_revoked_user_gets_access_revoked_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            code = storage.generate_registration_code()
+            user = storage.redeem_registration_code(code, 557, "tester")
+            save_dummy_credentials(storage, user.id)
+            storage.revoke_registration_code(code, reason="revoked")
+            panel = TelegramControlPanel(storage, AsyncMock())
+
+            start_update = fake_update(user.telegram_id)
+            await panel.start(start_update, SimpleNamespace(args=[]))
+            self.assertIn("access has been revoked", start_update.effective_message.replies[0][0])
+
+            watch_update = fake_update(user.telegram_id)
+            await panel.watch(watch_update, SimpleNamespace(args=["LCFAITH"]))
+            self.assertIn("access has been revoked", watch_update.effective_message.replies[0][0])
+            self.assertFalse(storage.list_jobs(user_id=user.id))
 
     async def test_successful_login_continues_to_onboarding_menu(self):
         with tempfile.TemporaryDirectory() as tmp:

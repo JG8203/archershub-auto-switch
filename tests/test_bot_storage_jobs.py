@@ -61,6 +61,43 @@ class StorageCryptoTests(unittest.TestCase):
             storage.set_interval_secs(45)
             self.assertEqual(storage.get_interval_secs(), 45)
 
+    def test_registration_code_revocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            unused_code = storage.generate_registration_code(ttl_hours=1)
+            revoked = storage.revoke_registration_code(unused_code, reason="test revoke")
+            self.assertIsNotNone(revoked.revoked_at)
+            self.assertEqual(revoked.revoked_reason, "test revoke")
+            with self.assertRaisesRegex(ValueError, "revoked"):
+                storage.redeem_registration_code(unused_code, 456, "tester")
+
+            used_code = storage.generate_registration_code(ttl_hours=1)
+            user = storage.redeem_registration_code(used_code, 789, "tester")
+            self.assertTrue(user.is_active)
+            storage.revoke_registration_code(used_code, reason="left")
+            self.assertFalse(storage.get_user_by_telegram_id(789).is_active)
+
+            with self.assertRaisesRegex(ValueError, "not found"):
+                storage.revoke_registration_code("missing")
+
+            listed = {row.code: row for row in storage.list_registration_codes()}
+            self.assertEqual(listed[unused_code].revoked_reason, "test revoke")
+            self.assertEqual(listed[used_code].used_by_telegram_id, 789)
+
+    def test_reactivate_user_by_id_or_telegram_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            code = storage.generate_registration_code(ttl_hours=1)
+            user = storage.redeem_registration_code(code, 123456, "tester")
+            storage.revoke_registration_code(code, reason="temporary")
+            self.assertFalse(storage.get_user_by_telegram_id(123456).is_active)
+
+            reactivated = storage.reactivate_user(user.id)
+            self.assertTrue(reactivated.is_active)
+            storage.revoke_registration_code(code, reason="temporary")
+            reactivated = storage.reactivate_user(123456)
+            self.assertTrue(reactivated.is_active)
+
 
 class NotificationDiffTests(unittest.TestCase):
     def test_filter_and_diff_availability_changes(self):

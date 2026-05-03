@@ -44,7 +44,7 @@ class TelegramControlPanel:
                 persistent=False,
             ),
             ConversationHandler(
-                entry_points=[CommandHandler("connect", self.connect), CallbackQueryHandler(self.connect, pattern="^connect$")],
+                entry_points=[CommandHandler(["connect", "login"], self.connect), CallbackQueryHandler(self.connect, pattern="^connect$")],
                 states={
                     ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_username)],
                     ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_password)],
@@ -181,6 +181,7 @@ class TelegramControlPanel:
             "• Change section only uses ArchersHub's change-section feature, never drop-add.\n\n"
             "Manage jobs:\n"
             "• /jobs — list saved jobs.\n"
+            "• /login — connect or update your saved ArchersHub login.\n"
             "• /recheck — force-check all active jobs now.\n"
             "• /recheck 12 — force-check only job #12 now.\n"
             "• /remove 12 — disable job #12.\n"
@@ -206,11 +207,11 @@ class TelegramControlPanel:
         if update.callback_query:
             await update.callback_query.answer()
         if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         ctx.user_data.clear()
         await update.effective_message.reply_text(
-            "Send your ArchersHub username/email. Use /cancel to stop.\n\n"
+            "Send your ArchersHub username/email. Use /cancel to stop. This will replace any saved ArchersHub login.\n\n"
             "I will store your login encrypted and use it only to check or submit your jobs."
         )
         return ASK_USERNAME
@@ -251,7 +252,7 @@ class TelegramControlPanel:
         await update.callback_query.answer()
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -275,7 +276,7 @@ class TelegramControlPanel:
     async def received_add_priorities(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         text = update.effective_message.text.strip()
         priorities = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
@@ -294,7 +295,7 @@ class TelegramControlPanel:
         await update.callback_query.answer()
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -316,7 +317,7 @@ class TelegramControlPanel:
     async def received_change_section(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         target = normalize_section_name(update.effective_message.text.strip())
         job = self.storage.add_job(
@@ -333,7 +334,7 @@ class TelegramControlPanel:
     async def change_section_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -358,7 +359,7 @@ class TelegramControlPanel:
     async def add_class_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -392,7 +393,7 @@ class TelegramControlPanel:
     async def watch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -424,7 +425,7 @@ class TelegramControlPanel:
         await update.callback_query.answer()
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         if not self._has_credentials(user.id):
             await update.effective_message.reply_text("Connect your ArchersHub account first.", reply_markup=self.connect_markup())
@@ -448,7 +449,7 @@ class TelegramControlPanel:
     async def received_watch_sections(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return ConversationHandler.END
         text = update.effective_message.text.strip()
         sections = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
@@ -506,7 +507,7 @@ class TelegramControlPanel:
     async def jobs(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         jobs = [
             job
@@ -544,7 +545,7 @@ class TelegramControlPanel:
     async def recheck(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if self.scheduler is None:
             await update.effective_message.reply_text("Recheck is unavailable because the background scheduler is not running.")
@@ -569,7 +570,7 @@ class TelegramControlPanel:
     async def confirm_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /confirm JOB_ID\nExample: /confirm 12")
@@ -630,7 +631,7 @@ class TelegramControlPanel:
     async def reject_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /reject JOB_ID\nExample: /reject 12")
@@ -645,7 +646,7 @@ class TelegramControlPanel:
 
     async def remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._registered(update):
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /remove JOB_ID\nExample: /remove 12")
@@ -655,12 +656,21 @@ class TelegramControlPanel:
 
     def _registered(self, update: Update):
         chat = update.effective_chat
-        return self.storage.get_user_by_telegram_id(chat.id) if chat else None
+        user = self.storage.get_user_by_telegram_id(chat.id) if chat else None
+        return user if user and user.is_active else None
+
+    def _inactive_user(self, update: Update):
+        chat = update.effective_chat
+        user = self.storage.get_user_by_telegram_id(chat.id) if chat else None
+        return user if user and not user.is_active else None
 
     def _has_credentials(self, user_id: int) -> bool:
         return self.storage.get_credentials(user_id) is not None
 
     async def _reply_registered_home(self, update: Update, user) -> None:
+        if not user.is_active:
+            await update.effective_message.reply_text("Your access has been revoked. Ask the service admin if you need access again.")
+            return
         if self._has_credentials(user.id):
             await update.effective_message.reply_text(self.onboarding_text(), reply_markup=self.main_menu_markup())
             return
@@ -668,6 +678,12 @@ class TelegramControlPanel:
             "You are registered. Next, connect your ArchersHub account so I can check sections for you.",
             reply_markup=self.connect_markup(),
         )
+
+    async def _reply_access_required(self, update: Update) -> None:
+        if self._inactive_user(update):
+            await update.effective_message.reply_text("Your access has been revoked. Ask the service admin if you need access again.")
+            return
+        await update.effective_message.reply_text("Register first with /start.")
 
     async def unknown_command(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
@@ -681,13 +697,15 @@ class TelegramControlPanel:
                 "command not recognized. Connect your ArchersHub account first.",
                 reply_markup=self.connect_markup(),
             )
+        elif self._inactive_user(update):
+            await update.effective_message.reply_text("Your access has been revoked. Ask the service admin if you need access again.")
         else:
             await update.effective_message.reply_text("command not recognized. Use /start to register.")
 
     async def _owned_job_or_reply(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, usage: str):
         user = self._registered(update)
         if not user:
-            await update.effective_message.reply_text("Register first with /start.")
+            await self._reply_access_required(update)
             return None
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text(usage)

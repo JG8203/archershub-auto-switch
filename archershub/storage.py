@@ -44,9 +44,12 @@ class UserRecord:
 @dataclass(frozen=True)
 class RegistrationCode:
     code: str
+    created_at: str
     expires_at: str | None
     used_at: str | None
     used_by_telegram_id: int | None
+    revoked_at: str | None = None
+    revoked_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -151,7 +154,9 @@ class SQLiteStorage:
                     created_at TEXT NOT NULL,
                     expires_at TEXT,
                     used_at TEXT,
-                    used_by_telegram_id INTEGER
+                    used_by_telegram_id INTEGER,
+                    revoked_at TEXT,
+                    revoked_reason TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS credentials (
@@ -227,6 +232,11 @@ class SQLiteStorage:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
             if "paused_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
+            code_columns = {row[1] for row in conn.execute("PRAGMA table_info(registration_codes)").fetchall()}
+            if "revoked_at" not in code_columns:
+                conn.execute("ALTER TABLE registration_codes ADD COLUMN revoked_at TEXT")
+            if "revoked_reason" not in code_columns:
+                conn.execute("ALTER TABLE registration_codes ADD COLUMN revoked_reason TEXT")
             now = dt_to_text(utcnow())
             conn.execute(
                 "INSERT OR IGNORE INTO scheduler_state(key, value, updated_at) VALUES('interval_secs', ?, ?)",
@@ -250,6 +260,8 @@ class SQLiteStorage:
             row = conn.execute("SELECT * FROM registration_codes WHERE code = ?", (code,)).fetchone()
             if row is None:
                 raise ValueError("registration code was not found")
+            if row["revoked_at"]:
+                raise ValueError("registration code was revoked")
             if row["used_at"]:
                 raise ValueError("registration code was already used")
             expires_at = text_to_dt(row["expires_at"])
@@ -270,6 +282,39 @@ class SQLiteStorage:
             )
             user_row = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
         return self._user_from_row(user_row)
+
+    def list_registration_codes(self) -> list[RegistrationCode]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM registration_codes ORDER BY created_at").fetchall()
+        return [RegistrationCode(**dict(row)) for row in rows]
+
+    def revoke_registration_code(self, code: str, *, reason: str | None = None) -> RegistrationCode:
+        now = dt_to_text(utcnow())
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM registration_codes WHERE code = ?", (code,)).fetchone()
+            if row is None:
+                raise ValueError("registration code was not found")
+            conn.execute(
+                """
+                UPDATE registration_codes
+                SET revoked_at = COALESCE(revoked_at, ?), revoked_reason = ?
+                WHERE code = ?
+                """,
+                (now, reason, code),
+            )
+            if row["used_by_telegram_id"] is not None:
+                conn.execute("UPDATE users SET is_active = 0 WHERE telegram_id = ?", (row["used_by_telegram_id"],))
+            updated = conn.execute("SELECT * FROM registration_codes WHERE code = ?", (code,)).fetchone()
+        return RegistrationCode(**dict(updated))
+
+    def reactivate_user(self, identifier: int) -> UserRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ? OR telegram_id = ?", (identifier, identifier)).fetchone()
+            if row is None:
+                raise ValueError("user was not found")
+            conn.execute("UPDATE users SET is_active = 1 WHERE id = ?", (row["id"],))
+            updated = conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+        return self._user_from_row(updated)
 
     def get_user_by_telegram_id(self, telegram_id: int) -> UserRecord | None:
         with self.connect() as conn:

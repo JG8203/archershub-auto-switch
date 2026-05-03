@@ -160,6 +160,9 @@ WantedBy=multi-user.target
 ```bash
 poetry run archershub-admin init-db
 poetry run archershub-admin generate-code --ttl-hours 24
+poetry run archershub-admin list-codes
+poetry run archershub-admin revoke-code ONE_TIME_CODE --reason "access removed"
+poetry run archershub-admin reactivate-user USER_ID_OR_TELEGRAM_ID
 poetry run archershub-admin list-users
 poetry run archershub-admin list-jobs
 poetry run archershub-admin list-failures
@@ -168,6 +171,8 @@ poetry run archershub-admin list-login-errors
 poetry run archershub-admin list-pending
 poetry run archershub-admin set-interval 30
 ```
+
+Revoking an unused registration code prevents future redemption while preserving an audit row. Revoking a used code also sets the matched user inactive, which blocks bot access and scheduler actions without deleting credentials, jobs, or history.
 
 ### User flow and commands
 
@@ -181,6 +186,7 @@ Power-user commands remain available:
 
 - `/watch LCFAITH` notifies when any section of a course gains available slots.
 - `/watch LCFAITH Z18 Z19` notifies only when listed sections gain available slots.
+- `/login` connects or replaces your saved ArchersHub login.
 - `/addclass LCFAITH:Z18,Z19` creates an add-class automation job.
 - `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting; pending add-class confirmations are submitted together as one add/drop batch.
 - `/change LCFAITH Z18` creates a change-section automation job.
