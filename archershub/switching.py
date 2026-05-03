@@ -183,6 +183,21 @@ def drop_add_switch_reflected(
     return current_section == normalize_section_name(target_section_name)
 
 
+def _verify_drop_add_after_delay(
+    session: requests.Session,
+    base_url: str,
+    target: dict[str, str],
+    target_section_name: str,
+) -> bool:
+    """Wait 10 seconds, then check whether the drop/add reflected server-side."""
+    time.sleep(10)
+    try:
+        return drop_add_switch_reflected(session, base_url, target, target_section_name)
+    except Exception as verify_exc:
+        log(f"could not verify post-submit state: {verify_exc}")
+        return False
+
+
 def validate_drop_add_course(row: dict[str, Any], course_code: str) -> None:
     blocked_reasons = []
     if str(row.get("pre_requisite_status", "0")) == "1":
@@ -270,13 +285,9 @@ def build_drop_add_payload(
     if missing:
         raise RuntimeError(f"missing required add/drop fields: {', '.join(missing)}")
 
-    enlisted_credits = current_enlisted_credits(state)
-    credits = parse_number(row.get("credits"))
-    unit = enlisted_credits
-    if str(row.get("is_exclude", "0")) != "0":
-        unit = enlisted_credits
-    else:
-        unit = (enlisted_credits - credits) + credits
+    # Drop + re-add of the same course has no net credit-load effect. If the
+    # course is excluded, it does not affect credit load either.
+    unit = current_enlisted_credits(state)
 
     max_credit = parse_number(state.get("max_credit")) + parse_number(state.get("max_credit_can_enroll"))
     min_credit = parse_number(state.get("min_credit"))
@@ -681,6 +692,39 @@ def maybe_submit_target_switch(
     return True
 
 
+def _build_clash_check_list(
+    add_drop_state: dict[str, Any],
+    target: dict[str, str],
+    target_section_id: str,
+) -> list[dict[str, Any]]:
+    """Return course+section pairs to pass to GetCourseClashDetails."""
+    clash_list: list[dict[str, Any]] = []
+    for row in first_list(add_drop_state, "drop_registered_course_list"):
+        if not isinstance(row, dict):
+            continue
+        section_id = (
+            target_section_id
+            if ids_equal(row.get("course_creation_id"), target["course_creation_id"])
+            else string_id(row.get("section_creation_id"))
+        )
+        clash_list.append(
+            {
+                "COURSE_CREATION_ID": string_id(row.get("course_creation_id")),
+                "SECTION_CREATION_ID": section_id,
+                "CAMPUSNO": string_id(add_drop_state.get("campusno") or row.get("parent_campus_no") or target["campus_id"]),
+            }
+        )
+    if clash_list:
+        return clash_list
+    return [
+        {
+            "COURSE_CREATION_ID": target["course_creation_id"],
+            "SECTION_CREATION_ID": target_section_id,
+            "CAMPUSNO": string_id(add_drop_state.get("campusno") or target["campus_id"]),
+        }
+    ]
+
+
 def maybe_submit_drop_add_switch(
     session: requests.Session,
     base_url: str,
@@ -748,32 +792,16 @@ def maybe_submit_drop_add_switch(
         drop_reason_id=drop_reason_id,
     )
 
-    clash_list = []
-    for row in first_list(add_drop_state, "drop_registered_course_list"):
-        if not isinstance(row, dict):
-            continue
-        section_id = target_section_id if ids_equal(row.get("course_creation_id"), target["course_creation_id"]) else string_id(row.get("section_creation_id"))
-        clash_list.append(
-            {
-                "COURSE_CREATION_ID": string_id(row.get("course_creation_id")),
-                "SECTION_CREATION_ID": section_id,
-                "CAMPUSNO": string_id(add_drop_state.get("campusno") or row.get("parent_campus_no") or target["campus_id"]),
-            }
-        )
-    if not clash_list:
-        clash_list.append(
-            {
-                "COURSE_CREATION_ID": target["course_creation_id"],
-                "SECTION_CREATION_ID": target_section_id,
-                "CAMPUSNO": string_id(add_drop_state.get("campusno") or target["campus_id"]),
-            }
-        )
-
     clash_response = post_form_json(
         session,
         base_url,
         "/Enlistment/GetCourseClashDetails/",
-        flatten_jquery_form({"academicSessionId": target["academic_session_id"], "CourseList": clash_list}),
+        flatten_jquery_form(
+            {
+                "academicSessionId": target["academic_session_id"],
+                "CourseList": _build_clash_check_list(add_drop_state, target, target_section_id),
+            }
+        ),
     )
     normalized = normalize_value(clash_response)
     if not isinstance(normalized, list) or not normalized or not isinstance(normalized[0], dict):
@@ -795,16 +823,12 @@ def maybe_submit_drop_add_switch(
             "drop/add submit did not return a clean response "
             f"({exc}); waiting 10 seconds before checking server state"
         )
-        time.sleep(10)
-        try:
-            if drop_add_switch_reflected(session, base_url, target, target_section_name):
-                log(
-                    "drop/add submit appears successful after timeout; "
-                    f"{target['course_code']} is now in {target_section_name}"
-                )
-                return True
-        except Exception as verify_exc:
-            log(f"could not verify post-submit state yet: {verify_exc}")
+        if _verify_drop_add_after_delay(session, base_url, target, target_section_name):
+            log(
+                "drop/add submit appears successful after timeout; "
+                f"{target['course_code']} is now in {target_section_name}"
+            )
+            return True
         raise AutoSwitchSubmitError(
             "drop/add submit was attempted but could not be verified; "
             "stopping to avoid a second add/drop submission"
@@ -814,16 +838,12 @@ def maybe_submit_drop_add_switch(
             "drop/add submit returned an error response "
             f"({exc}); waiting 10 seconds before verifying server state"
         )
-        time.sleep(10)
-        try:
-            if drop_add_switch_reflected(session, base_url, target, target_section_name):
-                log(
-                    "drop/add switch is reflected despite the error response; "
-                    f"{target['course_code']} is now in {target_section_name}"
-                )
-                return True
-        except Exception as verify_exc:
-            log(f"could not verify post-error state: {verify_exc}")
+        if _verify_drop_add_after_delay(session, base_url, target, target_section_name):
+            log(
+                "drop/add switch is reflected despite the error response; "
+                f"{target['course_code']} is now in {target_section_name}"
+            )
+            return True
         raise AutoSwitchSubmitError(
             "drop/add submit was attempted but did not return a clean success; "
             "stopping to avoid a second add/drop submission"

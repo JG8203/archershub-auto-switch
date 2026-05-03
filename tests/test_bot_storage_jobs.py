@@ -47,6 +47,7 @@ class StorageCryptoTests(unittest.TestCase):
 
             job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_NOTIFY, course_code="lcfaith", priority_sections=["C01"])
             self.assertEqual(job.course_code, "LCFAITH")
+            self.assertIsNone(job.course_creation_id)
             self.assertEqual(storage.list_jobs(user_id=user.id)[0].priority_sections, ["C01"])
             storage.set_pending_action(job_id=job.id, user_id=user.id, action_type="add_class", target_section="C02", details={"dedupe_key": "add:2"})
             pending = storage.get_pending_action(job.id)
@@ -83,6 +84,82 @@ class StorageCryptoTests(unittest.TestCase):
             listed = {row.code: row for row in storage.list_registration_codes()}
             self.assertEqual(listed[unused_code].revoked_reason, "test revoke")
             self.assertEqual(listed[used_code].used_by_telegram_id, 789)
+
+    def test_duplicate_active_jobs_are_not_inserted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 456, "tester")
+
+            first = storage.add_job(
+                user_id=user.id,
+                job_type=JOB_TYPE_CHANGE_SECTION,
+                mode=JOB_MODE_AUTO,
+                course_code="lcfaith",
+                course_creation_id="101",
+                target_section="y02",
+            )
+            duplicate = storage.add_job(
+                user_id=user.id,
+                job_type=JOB_TYPE_CHANGE_SECTION,
+                mode=JOB_MODE_NOTIFY,
+                course_code="LCFAITH",
+                course_creation_id="101",
+                target_section="Y02",
+            )
+
+            self.assertEqual(duplicate.id, first.id)
+            self.assertEqual(len(storage.list_jobs(user_id=user.id)), 1)
+
+            other_creation = storage.add_job(
+                user_id=user.id,
+                job_type=JOB_TYPE_CHANGE_SECTION,
+                mode=JOB_MODE_AUTO,
+                course_code="LCFAITH",
+                course_creation_id="102",
+                target_section="Y02",
+            )
+            self.assertNotEqual(other_creation.id, first.id)
+
+            storage.disable_job(first.id)
+            replacement = storage.add_job(
+                user_id=user.id,
+                job_type=JOB_TYPE_CHANGE_SECTION,
+                mode=JOB_MODE_AUTO,
+                course_code="LCFAITH",
+                course_creation_id="101",
+                target_section="Y02",
+            )
+            self.assertNotEqual(replacement.id, first.id)
+
+    def test_duplicate_active_job_audit_groups_existing_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 457, "tester")
+            first = storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="DSILYTC", section_filters=["V01"])
+            with storage.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO jobs(user_id, job_type, mode, course_code, section_filters_json,
+                                     priority_sections_json, target_section, enabled, created_at, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        user.id,
+                        JOB_TYPE_WATCH,
+                        JOB_MODE_NOTIFY,
+                        "DSILYTC",
+                        '["V01"]',
+                        "[]",
+                        None,
+                        first.created_at,
+                        first.created_at,
+                    ),
+                )
+
+            groups = storage.list_duplicate_active_jobs()
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual([job.course_code for job in groups[0]], ["DSILYTC", "DSILYTC"])
 
     def test_reactivate_user_by_id_or_telegram_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -230,6 +307,34 @@ class JobPlanningTests(unittest.TestCase):
             self.assertEqual(candidate.action, "change_not_eligible")
             self.assertTrue(candidate.details["warning_only"])
             self.assertTrue(storage.get_job(job.id).enabled)
+
+    def test_port_legacy_jobs_backfills_unique_and_pauses_ambiguous(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+                user = storage.redeem_registration_code(storage.generate_registration_code(), 321)
+                unique = storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="UNIQUE")
+                ambiguous = storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="DUPES")
+                service = BotArchersHubService(storage, SecretBox.from_secret("dev-secret"))
+                sent = []
+
+                async def resolve(_user_id, course_code):
+                    if course_code == "DUPES":
+                        raise RuntimeError("course code DUPES resolved to multiple courses")
+                    return {"course_code": course_code, "course_creation_id": "900", "campus_id": "1", "academic_session_id": "2"}
+
+                async def send(chat_id, text):
+                    sent.append((chat_id, text))
+
+                service.resolve_course_for_user = resolve  # type: ignore[method-assign]
+
+                await service.port_legacy_jobs(send)
+
+                self.assertEqual(storage.get_job(unique.id).course_creation_id, "900")
+                self.assertIsNotNone(storage.get_job(ambiguous.id).paused_at)
+                self.assertIn("recreate it through", sent[0][1])
+
+        asyncio.run(scenario())
 
 
 class SchedulerTests(unittest.TestCase):

@@ -115,6 +115,57 @@ def resolve_course_target(
         raise RuntimeError(f"course code {course_code} resolved to multiple courses: {choices}")
 
     selected = matches[0]
+    return course_target_from_item(selected, course_code, campus_id, academic_session_id)
+
+
+def resolve_course_target_by_id(
+    session: requests.Session,
+    base_url: str,
+    course_creation_id: str,
+    *,
+    campus_id: str | None = None,
+    academic_session_id: str | None = None,
+    course_code: str | None = None,
+) -> dict[str, str]:
+    context = normalize_value(post_form_json(session, base_url, "/CourseFinder/GetAllDropDownList/", {}))
+    if not isinstance(context, dict):
+        raise RuntimeError("course finder dropdown response was not an object")
+
+    campus_id = campus_id or first_string_field(context, "campus_drp", ["campusno", "campus_no", "value", "id"])
+    if not campus_id:
+        raise RuntimeError("unable to determine campus id")
+
+    academic_session_id = academic_session_id or current_session_id(context)
+    if not academic_session_id:
+        raise RuntimeError("unable to determine academic session id")
+
+    course_list = normalize_value(
+        post_form_json(
+            session,
+            base_url,
+            "/CourseFinder/GetCourseList/",
+            {"Campusno": campus_id, "AcademicSession": academic_session_id},
+        )
+    )
+    if not isinstance(course_list, dict) or not isinstance(course_list.get("course_drp"), list):
+        raise RuntimeError("course list response did not contain CourseDrp")
+
+    for item in course_list["course_drp"]:
+        if not isinstance(item, dict):
+            continue
+        if extract_course_creation_id(item) == str(course_creation_id):
+            return course_target_from_item(item, course_code or extract_course_code(item) or "", campus_id, academic_session_id)
+
+    label = f" for {course_code}" if course_code else ""
+    raise RuntimeError(f"course_creation_id {course_creation_id}{label} was not found")
+
+
+def course_target_from_item(
+    selected: dict[str, Any],
+    course_code: str,
+    campus_id: str,
+    academic_session_id: str,
+) -> dict[str, str]:
     return {
         "course_code": extract_course_code(selected) or course_code.upper(),
         "course_creation_id": extract_course_creation_id(selected) or "",

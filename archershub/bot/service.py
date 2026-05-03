@@ -14,7 +14,7 @@ from ..constants import AutoSwitchSubmitError, DEFAULT_BASE_URL, DEFAULT_LOGIN_P
 from ..course_search import compact_course, course_from_dict, course_search_context, fetch_course_options, reveal_teachers_with_schedule_data, search_courses, section_summary
 from ..crypto import SecretBox
 from ..jobs import AutomationBatchResult, AutomationCandidate, choose_add_class_section, plan_change_section
-from ..sections import fetch_course_data, resolve_course_target
+from ..sections import fetch_course_data, resolve_course_target, resolve_course_target_by_id
 from ..storage import JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, CredentialRecord, JobRecord, SQLiteStorage
 from ..switching import (
     add_academic_session_to_state,
@@ -138,7 +138,7 @@ class BotArchersHubService:
         session = create_session()
         apply_session_cookies_json(session, self.secret_box.decrypt_text(credentials.cookies_encrypted))
         try:
-            target = resolve_course_target(session, self.base_url, job.course_code)
+            target = self._resolve_job_target(session, job)
             course_data = fetch_course_data(session, self.base_url, target)
             return session, target, course_data
         except Exception:
@@ -159,9 +159,22 @@ class BotArchersHubService:
                 credentials.password_encrypted,
                 self.secret_box.encrypt_text(session_cookies_json(session)),
             )
-            target = resolve_course_target(session, self.base_url, job.course_code)
+            target = self._resolve_job_target(session, job)
             course_data = fetch_course_data(session, self.base_url, target)
             return session, target, course_data
+
+    def _resolve_job_target(self, session: Any, job: JobRecord) -> dict[str, str]:
+        if not job.course_creation_id:
+            raise RuntimeError(
+                f"job #{job.id} for {job.course_code} is missing course_creation_id; "
+                "recreate it through Course Search"
+            )
+        return resolve_course_target_by_id(
+            session,
+            self.base_url,
+            job.course_creation_id,
+            course_code=job.course_code,
+        )
 
 
     def _credentials_session(self, user_id: int) -> tuple[Any, CredentialRecord, str | None, str | None]:
@@ -214,6 +227,53 @@ class BotArchersHubService:
                 f"Automatic captcha solving failed after {exc.attempts} attempts while searching courses. "
                 "I sent the latest captcha image to the user."
             ) from exc
+
+    async def resolve_course_for_user(self, user_id: int, course_code: str) -> dict[str, str]:
+        try:
+            def load(session):
+                return resolve_course_target(session, self.base_url, course_code)
+            return await asyncio.to_thread(lambda: self._with_user_session_retry(user_id, load))
+        except AutomatedCaptchaEscalation as exc:
+            await self._notify_captcha_escalation(user_id, exc)
+            raise TelegramCaptchaRequired(
+                f"Automatic captcha solving failed after {exc.attempts} attempts while resolving {course_code}. "
+                "I sent the latest captcha image to the user."
+            ) from exc
+
+    async def port_legacy_jobs(self, send_message: Callable[[int, str], Awaitable[None]] | None = None) -> None:
+        for job in self.storage.list_jobs(active_only=True):
+            if job.course_creation_id:
+                continue
+            user = next((row for row in self.storage.list_users() if row.id == job.user_id and row.is_active), None)
+            try:
+                target = await self.resolve_course_for_user(job.user_id, job.course_code)
+            except Exception as exc:
+                self.storage.pause_job(job.id)
+                if user and send_message:
+                    await send_message(
+                        user.telegram_id,
+                        f"Paused legacy job #{job.id} for {job.course_code}: {exc}\n\n"
+                        "Please recreate it through 🔎 Search courses so the exact Course Finder offering is selected.",
+                    )
+                continue
+            duplicate = self.storage.find_duplicate_active_job(
+                user_id=job.user_id,
+                job_type=job.job_type,
+                course_code=target["course_code"],
+                course_creation_id=target["course_creation_id"],
+                section_filters=job.section_filters,
+                priority_sections=job.priority_sections,
+                target_section=job.target_section,
+            )
+            if duplicate is not None and duplicate.id != job.id:
+                self.storage.pause_job(job.id)
+                if user and send_message:
+                    await send_message(
+                        user.telegram_id,
+                        f"Paused duplicate legacy job #{job.id} for {job.course_code}; existing job #{duplicate.id} already targets this offering."
+                    )
+                continue
+            self.storage.update_job_course_creation_id(job.id, target["course_creation_id"])
 
     async def fetch_search_course_sections(self, user_id: int, course_data: dict[str, Any]) -> list[dict[str, Any]]:
         try:

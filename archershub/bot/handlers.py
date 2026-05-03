@@ -1,32 +1,32 @@
 from __future__ import annotations
 
 import logging
+from enum import IntEnum
 import secrets
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 from ..constants import AutoSwitchSubmitError
 from ..scheduler import WatchScheduler
 from ..sections import normalize_section_name
-from ..storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, SQLiteStorage
+from ..storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, SQLiteStorage, UserRecord
 from .messages import delete_message_safely
 from .parsing import MODE_VALUES, parse_addclass_specs
 from .service import BotArchersHubService, TelegramCaptchaRequired
 
-(
-    ASK_REGISTRATION_CODE,
-    ASK_USERNAME,
-    ASK_PASSWORD,
-    ASK_ADD_COURSE,
-    ASK_ADD_PRIORITIES,
-    ASK_CHANGE_COURSE,
-    ASK_CHANGE_SECTION,
-    ASK_WATCH_COURSE,
-    ASK_WATCH_SECTIONS,
-    ASK_SEARCH_QUERY,
-) = range(10)
+class ConversationState(IntEnum):
+    ASK_REGISTRATION_CODE = 0
+    ASK_USERNAME = 1
+    ASK_PASSWORD = 2
+    ASK_ADD_COURSE = 3
+    ASK_ADD_PRIORITIES = 4
+    ASK_CHANGE_COURSE = 5
+    ASK_CHANGE_SECTION = 6
+    ASK_WATCH_COURSE = 7
+    ASK_WATCH_SECTIONS = 8
+    ASK_SEARCH_QUERY = 9
 
 
 class TelegramControlPanel:
@@ -35,66 +35,78 @@ class TelegramControlPanel:
         self.archershub = archershub
         self.scheduler = scheduler
 
-    def build_handlers(self):
+    def _registration_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CommandHandler("start", self.start)],
+            states={
+                ConversationState.ASK_REGISTRATION_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_registration_code)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="register_telegram",
+            persistent=False,
+        )
+
+    def _connect_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CommandHandler(["connect", "login"], self.connect), CallbackQueryHandler(self.connect, pattern="^connect$")],
+            states={
+                ConversationState.ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_username)],
+                ConversationState.ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_password)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="connect_archershub",
+            persistent=False,
+        )
+
+    def _add_class_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.begin_add_wizard, pattern="^menu:add$")],
+            states={
+                ConversationState.ASK_ADD_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_add_course)],
+                ConversationState.ASK_ADD_PRIORITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_add_priorities)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="add_class_wizard",
+            persistent=False,
+        )
+
+    def _change_section_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.begin_change_wizard, pattern="^menu:change$")],
+            states={
+                ConversationState.ASK_CHANGE_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_change_course)],
+                ConversationState.ASK_CHANGE_SECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_change_section)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="change_section_wizard",
+            persistent=False,
+        )
+
+    def _watch_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.begin_watch_wizard, pattern="^menu:watch$")],
+            states={
+                ConversationState.ASK_WATCH_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_course)],
+                ConversationState.ASK_WATCH_SECTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_sections)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="watch_only_wizard",
+            persistent=False,
+        )
+
+    def _search_handler(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[CommandHandler("search", self.search), CallbackQueryHandler(self.begin_search_wizard, pattern="^menu:search$")],
+            states={
+                ConversationState.ASK_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_search_query)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            name="course_search",
+            persistent=False,
+        )
+
+    def _command_handlers(self) -> list:
         return [
-            ConversationHandler(
-                entry_points=[CommandHandler("start", self.start)],
-                states={
-                    ASK_REGISTRATION_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_registration_code)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="register_telegram",
-                persistent=False,
-            ),
-            ConversationHandler(
-                entry_points=[CommandHandler(["connect", "login"], self.connect), CallbackQueryHandler(self.connect, pattern="^connect$")],
-                states={
-                    ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_username)],
-                    ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_password)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="connect_archershub",
-                persistent=False,
-            ),
-            ConversationHandler(
-                entry_points=[CallbackQueryHandler(self.begin_add_wizard, pattern="^menu:add$")],
-                states={
-                    ASK_ADD_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_add_course)],
-                    ASK_ADD_PRIORITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_add_priorities)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="add_class_wizard",
-                persistent=False,
-            ),
-            ConversationHandler(
-                entry_points=[CallbackQueryHandler(self.begin_change_wizard, pattern="^menu:change$")],
-                states={
-                    ASK_CHANGE_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_change_course)],
-                    ASK_CHANGE_SECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_change_section)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="change_section_wizard",
-                persistent=False,
-            ),
-            ConversationHandler(
-                entry_points=[CallbackQueryHandler(self.begin_watch_wizard, pattern="^menu:watch$")],
-                states={
-                    ASK_WATCH_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_course)],
-                    ASK_WATCH_SECTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_watch_sections)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="watch_only_wizard",
-                persistent=False,
-            ),
-            ConversationHandler(
-                entry_points=[CommandHandler("search", self.search), CallbackQueryHandler(self.begin_search_wizard, pattern="^menu:search$")],
-                states={
-                    ASK_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.received_search_query)],
-                },
-                fallbacks=[CommandHandler("cancel", self.cancel)],
-                name="course_search",
-                persistent=False,
-            ),
             CommandHandler("help", self.help),
             CommandHandler("watch", self.watch),
             CommandHandler("change", self.change_section_job),
@@ -111,6 +123,17 @@ class TelegramControlPanel:
             CallbackQueryHandler(self.course_search_callback, pattern="^cs:"),
             CallbackQueryHandler(self.menu_callback, pattern="^menu:(jobs|help)$"),
             MessageHandler(filters.COMMAND, self.unknown_command),
+        ]
+
+    def build_handlers(self) -> list:
+        return [
+            self._registration_handler(),
+            self._connect_handler(),
+            self._add_class_handler(),
+            self._change_section_handler(),
+            self._watch_handler(),
+            self._search_handler(),
+            *self._command_handlers(),
         ]
 
     @staticmethod
@@ -155,13 +178,13 @@ class TelegramControlPanel:
                 "Welcome! Please send your one-time registration code.\n\n"
                 "Ask the service admin for a code if you do not have one yet."
             )
-            return ASK_REGISTRATION_CODE
+            return ConversationState.ASK_REGISTRATION_CODE
         await self._redeem_registration_code(update, ctx.args[0])
         return ConversationHandler.END
 
     async def received_registration_code(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
         registered = await self._redeem_registration_code(update, update.effective_message.text.strip())
-        return ConversationHandler.END if registered else ASK_REGISTRATION_CODE
+        return ConversationHandler.END if registered else ConversationState.ASK_REGISTRATION_CODE
 
     async def _redeem_registration_code(self, update: Update, code: str) -> bool:
         chat = update.effective_chat
@@ -230,13 +253,13 @@ class TelegramControlPanel:
             "Send your ArchersHub username/email. Use /cancel to stop. This will replace any saved ArchersHub login.\n\n"
             "I will store your login encrypted and use it only to check or submit your jobs."
         )
-        return ASK_USERNAME
+        return ConversationState.ASK_USERNAME
 
     async def received_username(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data["archershub_username"] = update.effective_message.text.strip()
         await delete_message_safely(update.effective_message)
         await update.effective_chat.send_message("Now send your ArchersHub password. I will try to delete the message after processing.")
-        return ASK_PASSWORD
+        return ConversationState.ASK_PASSWORD
 
     async def received_password(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         chat = update.effective_chat
@@ -279,7 +302,7 @@ class TelegramControlPanel:
             "Use this for a course you are not enlisted in yet. I will not drop or change existing classes.\n\n"
             "Send the course code, e.g. LCFAITH."
         )
-        return ASK_ADD_COURSE
+        return ConversationState.ASK_ADD_COURSE
 
     async def received_add_course(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data["add_course_code"] = update.effective_message.text.strip().upper()
@@ -287,12 +310,15 @@ class TelegramControlPanel:
             "Optional: send priority sections separated by spaces or commas, e.g. Z18 Z19.\n"
             "Send '-' to skip priorities and use the first safe open section."
         )
-        return ASK_ADD_PRIORITIES
+        return ConversationState.ASK_ADD_PRIORITIES
 
     async def received_add_priorities(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
             await self._reply_access_required(update)
+            return ConversationHandler.END
+        target = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("add_course_code", ""))
+        if target is None:
             return ConversationHandler.END
         text = update.effective_message.text.strip()
         priorities = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
@@ -300,7 +326,8 @@ class TelegramControlPanel:
             user_id=user.id,
             job_type=JOB_TYPE_ADD_CLASS,
             mode=JOB_MODE_AUTO,
-            course_code=ctx.user_data.get("add_course_code", ""),
+            course_code=target["course_code"],
+            course_creation_id=target["course_creation_id"],
             priority_sections=priorities,
         )
         ctx.user_data.clear()
@@ -323,24 +350,28 @@ class TelegramControlPanel:
             "This uses ArchersHub's change-section function only; it never drop-adds.\n\n"
             "Send the course code, e.g. LCFAITH."
         )
-        return ASK_CHANGE_COURSE
+        return ConversationState.ASK_CHANGE_COURSE
 
     async def received_change_course(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data["change_course_code"] = update.effective_message.text.strip().upper()
         await update.effective_message.reply_text("Send the target section, e.g. Z18.")
-        return ASK_CHANGE_SECTION
+        return ConversationState.ASK_CHANGE_SECTION
 
     async def received_change_section(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
             await self._reply_access_required(update)
             return ConversationHandler.END
+        target_course = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("change_course_code", ""))
+        if target_course is None:
+            return ConversationHandler.END
         target = normalize_section_name(update.effective_message.text.strip())
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_CHANGE_SECTION,
             mode=JOB_MODE_AUTO,
-            course_code=ctx.user_data.get("change_course_code", ""),
+            course_code=target_course["course_code"],
+            course_creation_id=target_course["course_creation_id"],
             target_section=target,
         )
         ctx.user_data.clear()
@@ -362,12 +393,16 @@ class TelegramControlPanel:
                 "Use this only for a class you already have. It uses ArchersHub change-section, never drop-add."
             )
             return
+        target_course = await self._resolve_course_or_reply(update, user.id, ctx.args[0])
+        if target_course is None:
+            return
         mode = self._mode_from_args(ctx.args[2:])
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_CHANGE_SECTION,
             mode=mode,
-            course_code=ctx.args[0].upper(),
+            course_code=target_course["course_code"],
+            course_creation_id=target_course["course_creation_id"],
             target_section=normalize_section_name(ctx.args[1]),
         )
         await update.effective_message.reply_text(self._change_job_confirmation(job))
@@ -394,16 +429,21 @@ class TelegramControlPanel:
         except ValueError as exc:
             await update.effective_message.reply_text(f"Invalid add-class request: {exc}\nExample: /addclass LCFAITH:Z18,Z19")
             return
-        jobs = [
-            self.storage.add_job(
+        jobs = []
+        for course_code, priorities in specs:
+            target_course = await self._resolve_course_or_reply(update, user.id, course_code)
+            if target_course is None:
+                return
+            jobs.append(
+                self.storage.add_job(
                 user_id=user.id,
                 job_type=JOB_TYPE_ADD_CLASS,
                 mode=mode,
-                course_code=course_code,
+                course_code=target_course["course_code"],
+                course_creation_id=target_course["course_creation_id"],
                 priority_sections=priorities,
             )
-            for course_code, priorities in specs
-        ]
+            )
         await update.effective_message.reply_text("\n\n".join(self._add_job_confirmation(job) for job in jobs))
 
     async def watch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -422,12 +462,16 @@ class TelegramControlPanel:
                 "This only notifies you when matching sections have available slots. It never submits changes."
             )
             return
+        target_course = await self._resolve_course_or_reply(update, user.id, ctx.args[0])
+        if target_course is None:
+            return
         sections = [normalize_section_name(arg) for arg in ctx.args[1:]]
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_WATCH,
             mode=JOB_MODE_NOTIFY,
-            course_code=ctx.args[0].upper(),
+            course_code=target_course["course_code"],
+            course_creation_id=target_course["course_creation_id"],
             section_filters=sections,
         )
         target = "all sections" if not sections else ", ".join(sections)
@@ -452,7 +496,7 @@ class TelegramControlPanel:
             "I will notify you when matching sections get slots. I will not submit anything.\n\n"
             "Send the course code, e.g. LCFAITH."
         )
-        return ASK_WATCH_COURSE
+        return ConversationState.ASK_WATCH_COURSE
 
     async def received_watch_course(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data["watch_course_code"] = update.effective_message.text.strip().upper()
@@ -460,12 +504,15 @@ class TelegramControlPanel:
             "Optional: send sections to watch separated by spaces or commas, e.g. Z18 Z19.\n"
             "Send '-' to watch all sections."
         )
-        return ASK_WATCH_SECTIONS
+        return ConversationState.ASK_WATCH_SECTIONS
 
     async def received_watch_sections(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
         if not user:
             await self._reply_access_required(update)
+            return ConversationHandler.END
+        target_course = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("watch_course_code", ""))
+        if target_course is None:
             return ConversationHandler.END
         text = update.effective_message.text.strip()
         sections = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
@@ -473,7 +520,8 @@ class TelegramControlPanel:
             user_id=user.id,
             job_type=JOB_TYPE_WATCH,
             mode=JOB_MODE_NOTIFY,
-            course_code=ctx.user_data.get("watch_course_code", ""),
+            course_code=target_course["course_code"],
+            course_creation_id=target_course["course_creation_id"],
             section_filters=sections,
         )
         ctx.user_data.clear()
@@ -497,7 +545,7 @@ class TelegramControlPanel:
             return ConversationHandler.END
         ctx.user_data.clear()
         await update.effective_message.reply_text("Course Search\n\nSend a subject code or keyword, e.g. LCFAITH or accounting.")
-        return ASK_SEARCH_QUERY
+        return ConversationState.ASK_SEARCH_QUERY
 
     async def search(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         user = self._registered(update)
@@ -509,7 +557,7 @@ class TelegramControlPanel:
             return ConversationHandler.END
         if not ctx.args:
             await update.effective_message.reply_text("Course Search\n\nSend a subject code or keyword, e.g. LCFAITH or accounting.")
-            return ASK_SEARCH_QUERY
+            return ConversationState.ASK_SEARCH_QUERY
         await self._run_course_search(update, user, " ".join(ctx.args))
         return ConversationHandler.END
 
@@ -613,6 +661,7 @@ class TelegramControlPanel:
             return
         course = courses[course_index]
         course_code = str(course.get("course_code") or "").upper()
+        course_creation_id = str(course.get("course_creation_id") or "")
         section = None
         if section_index is not None:
             section = self._section_at(state, course_index, section_index)
@@ -620,16 +669,16 @@ class TelegramControlPanel:
                 await update.effective_message.reply_text("That section result was not found. Open the course from search again.")
                 return
         if action == "watch":
-            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code=course_code, section_filters=[section["section_name"]])
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code=course_code, course_creation_id=course_creation_id, section_filters=[section["section_name"]])
             await update.effective_message.reply_text(f"Saved watch job #{job.id} for {course_code} {section['section_name']}.", reply_markup=self.main_menu_markup())
         elif action == "add":
-            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, priority_sections=[section["section_name"]])
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, course_creation_id=course_creation_id, priority_sections=[section["section_name"]])
             await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
         elif action == "change":
-            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_CHANGE_SECTION, mode=JOB_MODE_AUTO, course_code=course_code, target_section=section["section_name"])
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_CHANGE_SECTION, mode=JOB_MODE_AUTO, course_code=course_code, course_creation_id=course_creation_id, target_section=section["section_name"])
             await update.effective_message.reply_text(self._change_job_confirmation(job), reply_markup=self.main_menu_markup())
         elif action == "addall":
-            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, priority_sections=[])
+            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, course_creation_id=course_creation_id, priority_sections=[])
             await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
         else:
             await update.effective_message.reply_text("That search action was invalid. Use /search to start again.")
@@ -769,10 +818,10 @@ class TelegramControlPanel:
         await update.effective_message.reply_text(f"Updated job #{job.id} target to {target}.")
 
     async def jobs(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        user = self._registered(update)
-        if not user:
-            await self._reply_access_required(update)
+        active = await self._get_active_user(update)
+        if active is None:
             return
+        user, _chat = active
         jobs = [
             job
             for job in self.storage.list_jobs(user_id=user.id)
@@ -807,10 +856,10 @@ class TelegramControlPanel:
         await update.effective_message.reply_text("\n".join(lines), reply_markup=self.main_menu_markup())
 
     async def recheck(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        user = self._registered(update)
-        if not user:
-            await self._reply_access_required(update)
+        active = await self._get_active_user(update)
+        if active is None:
             return
+        user, _chat = active
         if self.scheduler is None:
             await update.effective_message.reply_text("Recheck is unavailable because the background scheduler is not running.")
             return
@@ -909,8 +958,8 @@ class TelegramControlPanel:
         await update.effective_message.reply_text(f"Cleared pending confirmation for job #{job_id}.")
 
     async def remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._registered(update):
-            await self._reply_access_required(update)
+        active = await self._get_active_user(update)
+        if active is None:
             return
         if not ctx.args or not ctx.args[0].isdigit():
             await update.effective_message.reply_text("Usage: /remove JOB_ID\nExample: /remove 12")
@@ -922,6 +971,17 @@ class TelegramControlPanel:
         chat = update.effective_chat
         user = self.storage.get_user_by_telegram_id(chat.id) if chat else None
         return user if user and user.is_active else None
+
+    async def _get_active_user(self, update: Update) -> tuple[UserRecord, Chat] | None:
+        """Return (user, chat) for active registered users, or reject the update."""
+        chat = update.effective_chat
+        if chat is None:
+            return None
+        user = self.storage.get_user_by_telegram_id(chat.id)
+        if user and user.is_active:
+            return user, chat
+        await self._reply_access_required(update)
+        return None
 
     def _inactive_user(self, update: Update):
         chat = update.effective_chat
@@ -979,6 +1039,29 @@ class TelegramControlPanel:
             await update.effective_message.reply_text("That job was not found.")
             return None
         return job
+
+    async def _resolve_course_or_reply(self, update: Update, user_id: int, course_code: str) -> dict[str, str] | None:
+        course_code = (course_code or "").strip().upper()
+        if not course_code:
+            await update.effective_message.reply_text("Course code is required. Use 🔎 Search courses if you are unsure.")
+            return None
+        try:
+            return await self.archershub.resolve_course_for_user(user_id, course_code)
+        except TelegramCaptchaRequired as exc:
+            await update.effective_message.reply_text(str(exc))
+            return None
+        except Exception as exc:
+            message = str(exc)
+            if "resolved to multiple courses" in message:
+                await update.effective_message.reply_text(
+                    f"{course_code} has multiple Course Finder matches. Use 🔎 Search courses or /search {course_code} "
+                    "and choose the exact offering."
+                )
+            elif "was not found" in message:
+                await update.effective_message.reply_text(f"{course_code} was not found in Course Finder.")
+            else:
+                await update.effective_message.reply_text(f"Could not resolve {course_code}: {exc}")
+            return None
 
     @staticmethod
     def _mode_from_args(args: list[str]) -> str:

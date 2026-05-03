@@ -54,6 +54,17 @@ def save_dummy_credentials(storage: SQLiteStorage, user_id: int) -> None:
     storage.save_credentials(user_id, "username", "password", "{}")
 
 
+def resolved_course(code: str) -> dict[str, str]:
+    return {
+        "course_code": code.upper(),
+        "course_creation_id": f"id-{code.upper()}",
+        "campus_id": "1",
+        "academic_session_id": "2",
+        "is_cross_offer": "0",
+        "grid_type": "0",
+    }
+
+
 def command_names(handlers) -> set[str]:
     names: set[str] = set()
     for handler in handlers:
@@ -215,7 +226,9 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
             user = storage.redeem_registration_code(storage.generate_registration_code(), 456, "tester")
-            panel = TelegramControlPanel(storage, AsyncMock())
+            service = AsyncMock()
+            service.resolve_course_for_user.side_effect = lambda _user_id, code: resolved_course(code)
+            panel = TelegramControlPanel(storage, service)
             ctx = SimpleNamespace(user_data={})
 
             await panel.received_add_course(fake_update(user.telegram_id, "LCFAITH"), ctx)
@@ -228,8 +241,10 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             jobs = storage.list_jobs(user_id=user.id)
             self.assertEqual(jobs[0].job_type, JOB_TYPE_ADD_CLASS)
             self.assertEqual(jobs[0].mode, JOB_MODE_AUTO)
+            self.assertEqual(jobs[0].course_creation_id, "id-LCFAITH")
             self.assertEqual(jobs[0].priority_sections, ["Z18", "Z19"])
             self.assertEqual(jobs[1].job_type, JOB_TYPE_CHANGE_SECTION)
+            self.assertEqual(jobs[1].course_creation_id, "id-GETEAMS")
             self.assertEqual(jobs[1].target_section, "S11")
 
     async def test_watch_command_creates_notification_job(self):
@@ -237,7 +252,9 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
             user = storage.redeem_registration_code(storage.generate_registration_code(), 654, "tester")
             save_dummy_credentials(storage, user.id)
-            panel = TelegramControlPanel(storage, AsyncMock())
+            service = AsyncMock()
+            service.resolve_course_for_user.side_effect = lambda _user_id, code: resolved_course(code)
+            panel = TelegramControlPanel(storage, service)
             update = fake_update(user.telegram_id)
             ctx = SimpleNamespace(args=["LCFAITH", "Z18", "Z19"])
 
@@ -245,15 +262,34 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
 
             job = storage.list_jobs(user_id=user.id)[0]
             self.assertEqual(job.job_type, "watch")
+            self.assertEqual(job.course_creation_id, "id-LCFAITH")
             self.assertEqual(job.section_filters, ["Z18", "Z19"])
             self.assertIn("Saved watch job", update.effective_message.replies[0][0])
+
+    async def test_manual_duplicate_course_code_points_to_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 657, "tester")
+            save_dummy_credentials(storage, user.id)
+            service = AsyncMock()
+            service.resolve_course_for_user.side_effect = RuntimeError("course code DSILYTC resolved to multiple courses: 1, 2")
+            panel = TelegramControlPanel(storage, service)
+            update = fake_update(user.telegram_id)
+
+            await panel.watch(update, SimpleNamespace(args=["DSILYTC", "V01"]))
+
+            self.assertFalse(storage.list_jobs(user_id=user.id))
+            self.assertIn("multiple Course Finder matches", update.effective_message.replies[0][0])
+            self.assertIn("/search DSILYTC", update.effective_message.replies[0][0])
 
     async def test_watch_wizard_creates_notification_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
             user = storage.redeem_registration_code(storage.generate_registration_code(), 655, "tester")
             save_dummy_credentials(storage, user.id)
-            panel = TelegramControlPanel(storage, AsyncMock())
+            service = AsyncMock()
+            service.resolve_course_for_user.side_effect = lambda _user_id, code: resolved_course(code)
+            panel = TelegramControlPanel(storage, service)
             ctx = SimpleNamespace(user_data={})
 
             await panel.received_watch_course(fake_update(user.telegram_id, "LCFAITH"), ctx)
@@ -262,6 +298,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             job = storage.list_jobs(user_id=user.id)[0]
             self.assertEqual(job.job_type, "watch")
             self.assertEqual(job.mode, JOB_MODE_NOTIFY)
+            self.assertEqual(job.course_creation_id, "id-LCFAITH")
             self.assertEqual(job.section_filters, ["Z18", "Z19"])
 
     async def test_unknown_command_replies_with_not_recognized(self):
@@ -379,12 +416,16 @@ class TelegramCourseSearchTests(unittest.IsolatedAsyncioTestCase):
 
             jobs = storage.list_jobs(user_id=user.id)
             self.assertEqual(jobs[0].job_type, "watch")
+            self.assertEqual(jobs[0].course_creation_id, "10")
             self.assertEqual(jobs[0].section_filters, ["Z18"])
             self.assertEqual(jobs[1].job_type, JOB_TYPE_ADD_CLASS)
+            self.assertEqual(jobs[1].course_creation_id, "10")
             self.assertEqual(jobs[1].priority_sections, ["Z18"])
             self.assertEqual(jobs[2].job_type, JOB_TYPE_CHANGE_SECTION)
+            self.assertEqual(jobs[2].course_creation_id, "10")
             self.assertEqual(jobs[2].target_section, "Z18")
             self.assertEqual(jobs[3].job_type, JOB_TYPE_ADD_CLASS)
+            self.assertEqual(jobs[3].course_creation_id, "10")
             self.assertEqual(jobs[3].priority_sections, [])
 
     async def test_search_requires_credentials(self):

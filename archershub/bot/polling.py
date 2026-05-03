@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 from io import BytesIO
+import logging
 import os
 
 from telegram.ext import Application
@@ -19,6 +20,17 @@ def build_application() -> Application:
     load_project_env()
     token = os.environ["BOT_TOKEN"]
     storage = SQLiteStorage(os.getenv("ARCHERSHUB_DB", "archershub_bot.sqlite3"))
+    duplicate_groups = storage.list_duplicate_active_jobs()
+    for jobs in duplicate_groups:
+        ids = ", ".join(f"#{job.id}" for job in jobs)
+        sample = jobs[0]
+        logging.warning(
+            "duplicate active Telegram bot jobs found on startup: user_id=%s type=%s course=%s jobs=%s",
+            sample.user_id,
+            sample.job_type,
+            sample.course_code,
+            ids,
+        )
     tg_app = Application.builder().token(token).build()
 
     async def send_captcha_image(chat_id: int, image_bytes: bytes, caption: str) -> None:
@@ -38,6 +50,7 @@ def build_application() -> Application:
     )
     tg_app.add_handlers(TelegramControlPanel(storage, ah_service, scheduler).build_handlers())
     tg_app.bot_data["storage"] = storage
+    tg_app.bot_data["archershub_service"] = ah_service
     tg_app.bot_data["scheduler"] = scheduler
     tg_app.bot_data["scheduler_task"] = None
     return tg_app
@@ -61,6 +74,9 @@ async def stop_background_scheduler(app: Application) -> None:
 async def clear_webhook_before_polling(app: Application) -> None:
     drop_updates = os.getenv("TELEGRAM_DROP_PENDING_UPDATES", "").lower() in {"1", "true", "yes"}
     await app.bot.delete_webhook(drop_pending_updates=drop_updates)
+    ah_service = app.bot_data.get("archershub_service")
+    if ah_service is not None:
+        await ah_service.port_legacy_jobs(lambda chat_id, text: app.bot.send_message(chat_id=chat_id, text=text))
     await start_background_scheduler(app)
 
 

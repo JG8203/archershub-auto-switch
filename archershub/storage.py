@@ -68,6 +68,7 @@ class JobRecord:
     job_type: str
     mode: str
     course_code: str
+    course_creation_id: str | None
     section_filters: list[str]
     priority_sections: list[str]
     target_section: str | None
@@ -173,6 +174,7 @@ class SQLiteStorage:
                     job_type TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     course_code TEXT NOT NULL,
+                    course_creation_id TEXT,
                     section_filters_json TEXT NOT NULL DEFAULT '[]',
                     priority_sections_json TEXT NOT NULL DEFAULT '[]',
                     target_section TEXT,
@@ -230,6 +232,8 @@ class SQLiteStorage:
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "course_creation_id" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN course_creation_id TEXT")
             if "paused_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
             code_columns = {row[1] for row in conn.execute("PRAGMA table_info(registration_codes)").fetchall()}
@@ -353,24 +357,37 @@ class SQLiteStorage:
         user_id: int,
         job_type: str,
         course_code: str,
+        course_creation_id: str | None = None,
         mode: str = JOB_MODE_NOTIFY,
         section_filters: list[str] | None = None,
         priority_sections: list[str] | None = None,
         target_section: str | None = None,
     ) -> JobRecord:
         now = dt_to_text(utcnow())
+        duplicate = self.find_duplicate_active_job(
+            user_id=user_id,
+            job_type=job_type,
+            course_code=course_code,
+            course_creation_id=course_creation_id,
+            section_filters=section_filters,
+            priority_sections=priority_sections,
+            target_section=target_section,
+        )
+        if duplicate is not None:
+            return duplicate
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO jobs(user_id, job_type, mode, course_code, section_filters_json,
+                INSERT INTO jobs(user_id, job_type, mode, course_code, course_creation_id, section_filters_json,
                                  priority_sections_json, target_section, enabled, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     user_id,
                     job_type,
                     mode,
                     course_code.upper(),
+                    str(course_creation_id) if course_creation_id else None,
                     json.dumps(section_filters or []),
                     json.dumps(priority_sections or []),
                     target_section.upper() if target_section else None,
@@ -380,6 +397,44 @@ class SQLiteStorage:
             )
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (cur.lastrowid,)).fetchone()
         return self._job_from_row(row)
+
+    def find_duplicate_active_job(
+        self,
+        *,
+        user_id: int,
+        job_type: str,
+        course_code: str,
+        course_creation_id: str | None = None,
+        section_filters: list[str] | None = None,
+        priority_sections: list[str] | None = None,
+        target_section: str | None = None,
+    ) -> JobRecord | None:
+        wanted_key = self._job_duplicate_key_values(
+            user_id=user_id,
+            job_type=job_type,
+            course_code=course_code,
+            course_creation_id=course_creation_id,
+            section_filters=section_filters,
+            priority_sections=priority_sections,
+            target_section=target_section,
+        )
+        for job in self.list_jobs(user_id=user_id, active_only=True):
+            if self._job_duplicate_key(job) == wanted_key:
+                return job
+        return None
+
+    def list_duplicate_active_jobs(self) -> list[list[JobRecord]]:
+        groups: dict[tuple[Any, ...], list[JobRecord]] = {}
+        for job in self.list_jobs(active_only=True):
+            groups.setdefault(self._job_duplicate_key(job), []).append(job)
+        return [jobs for jobs in groups.values() if len(jobs) > 1]
+
+    def update_job_course_creation_id(self, job_id: int, course_creation_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET course_creation_id = ?, updated_at = ? WHERE id = ?",
+                (str(course_creation_id), dt_to_text(utcnow()), job_id),
+            )
 
     def list_jobs(self, *, user_id: int | None = None, active_only: bool = False) -> list[JobRecord]:
         query = "SELECT * FROM jobs"
@@ -537,17 +592,22 @@ class SQLiteStorage:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO job_runtime(job_id, failure_count, last_error, last_error_at, next_retry_at, last_success_at, last_checked_at, last_action, last_message)
-                VALUES(?, 0, NULL, NULL, NULL, ?, ?, ?, ?)
+                INSERT INTO job_runtime (
+                    job_id, failure_count,
+                    last_error, last_error_at, next_retry_at,
+                    last_success_at, last_checked_at,
+                    last_action, last_message
+                )
+                VALUES (?, 0, NULL, NULL, NULL, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
-                  failure_count=0,
-                  last_error=NULL,
-                  last_error_at=NULL,
-                  next_retry_at=NULL,
-                  last_success_at=excluded.last_success_at,
-                  last_checked_at=excluded.last_checked_at,
-                  last_action=excluded.last_action,
-                  last_message=excluded.last_message
+                    failure_count   = 0,
+                    last_error      = NULL,
+                    last_error_at   = NULL,
+                    next_retry_at   = NULL,
+                    last_success_at = excluded.last_success_at,
+                    last_checked_at = excluded.last_checked_at,
+                    last_action     = excluded.last_action,
+                    last_message    = excluded.last_message
                 """,
                 (job_id, now, now, action, message),
             )
@@ -671,3 +731,42 @@ class SQLiteStorage:
         data["priority_sections"] = json.loads(data.pop("priority_sections_json") or "[]")
         data["enabled"] = bool(data["enabled"])
         return JobRecord(**data)
+
+    @staticmethod
+    def _normalized_sections(values: list[str] | None, *, ordered: bool) -> tuple[str, ...]:
+        normalized = tuple(" ".join(str(value).upper().split()) for value in (values or []) if str(value).strip())
+        return normalized if ordered else tuple(sorted(normalized))
+
+    @classmethod
+    def _job_duplicate_key_values(
+        cls,
+        *,
+        user_id: int,
+        job_type: str,
+        course_code: str,
+        course_creation_id: str | None = None,
+        section_filters: list[str] | None = None,
+        priority_sections: list[str] | None = None,
+        target_section: str | None = None,
+    ) -> tuple[Any, ...]:
+        return (
+            user_id,
+            job_type,
+            " ".join(str(course_code).upper().split()),
+            str(course_creation_id) if course_creation_id else None,
+            cls._normalized_sections(section_filters, ordered=False),
+            cls._normalized_sections(priority_sections, ordered=True),
+            " ".join(str(target_section or "").upper().split()) or None,
+        )
+
+    @classmethod
+    def _job_duplicate_key(cls, job: JobRecord) -> tuple[Any, ...]:
+        return cls._job_duplicate_key_values(
+            user_id=job.user_id,
+            job_type=job.job_type,
+            course_code=job.course_code,
+            course_creation_id=job.course_creation_id,
+            section_filters=job.section_filters,
+            priority_sections=job.priority_sections,
+            target_section=job.target_section,
+        )
