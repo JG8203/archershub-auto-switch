@@ -34,6 +34,63 @@ class CaptchaHelperTests(unittest.TestCase):
         self.assertEqual(ctx.exception.attempts, 5)
         self.assertEqual(ctx.exception.image_bytes, b"image-data")
 
+    def test_login_retry_fetches_fresh_page_and_captcha_each_attempt(self):
+        class FakeResponse:
+            def __init__(self, *, text="", url="https://example.com/StudentLogin", content=b"", data=None, status_code=200):
+                self.text = text
+                self.url = url
+                self.content = content
+                self._data = data or {}
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._data
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.cookies = {}
+                self.get_urls = []
+
+            def get(self, url, **_kwargs):
+                self.get_urls.append(url)
+                if "ShowCaptchaImage" in url:
+                    return FakeResponse(content=f"captcha-{len(self.get_urls)}".encode())
+                if "api.ipify.org" in url:
+                    return FakeResponse(data={"ip": "127.0.0.1"})
+                if "getEncryptPassword" in url:
+                    return FakeResponse(data={"key": "1234567890123456", "iv": "6543210987654321"})
+                return FakeResponse(
+                    text='<form id="LoginForm" action="/StudentLogin/Login"><input type="hidden" name="__RequestVerificationToken" value="tok"></form>',
+                    url="https://example.com/StudentLogin",
+                )
+
+            def post(self, url, **_kwargs):
+                if "GetLoginConfigurationDetails" in url:
+                    return FakeResponse(data={"IS_LOAD_TESTING": 1})
+                return FakeResponse(text='<form id="LoginForm"></form>', url="https://example.com/StudentLogin")
+
+        from archershub.auth import login_with_retry
+
+        sessions = [FakeSession(), FakeSession()]
+        with patch("archershub.auth.create_session", side_effect=sessions), patch("archershub.auth.read_captcha", return_value="ABC123"):
+            with self.assertRaises(AutomatedCaptchaEscalation):
+                login_with_retry(
+                    "https://example.com",
+                    "StudentLogin",
+                    "user",
+                    "pass",
+                    max_attempts=2,
+                    manual_captcha_fallback=False,
+                    save_artifacts=False,
+                )
+
+        self.assertEqual(sum(any(url.endswith("/StudentLogin") for url in session.get_urls) for session in sessions), 2)
+        self.assertEqual(sum(any("ShowCaptchaImage" in url for url in session.get_urls) for session in sessions), 2)
+
 
 class BotCaptchaEscalationTests(unittest.IsolatedAsyncioTestCase):
     async def test_verify_credentials_sends_captcha_image_after_automated_failures(self):

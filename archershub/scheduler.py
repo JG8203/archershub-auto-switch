@@ -7,8 +7,7 @@ from datetime import timedelta
 from typing import Any, Awaitable, Callable
 
 from .jobs import AutomationCandidate
-from .notifications import compact_sections, diff_sections, filter_sections, format_changes, has_changes
-from .storage import JOB_MODE_AUTO, JOB_MODE_CONFIRM, JOB_MODE_NOTIFY, JOB_TYPE_WATCH, JobRecord, SQLiteStorage, dt_to_text, text_to_dt, utcnow
+from .storage import JOB_MODE_AUTO, JOB_MODE_CONFIRM, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JobRecord, SQLiteStorage, dt_to_text, text_to_dt, utcnow
 
 FetchCourse = Callable[[JobRecord], Awaitable[Any]]
 SendMessage = Callable[[int, str], Awaitable[None]]
@@ -24,7 +23,7 @@ class SchedulerCycleResult:
 
 
 class WatchScheduler:
-    """Global checker that processes all active watcher jobs at the admin interval."""
+    """Global checker that processes add-class and change-section automation jobs."""
 
     def __init__(
         self,
@@ -67,35 +66,19 @@ class WatchScheduler:
         checked = 0
         sent = 0
         errors: list[str] = []
-        cycle_cache: dict[tuple[int, str], Any] = {}
 
         for job in jobs:
+            if job.job_type not in {JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
+                continue
             if not ignore_backoff and self._is_backing_off(job):
                 continue
             checked += 1
             try:
                 self.storage.record_job_checked(job.id)
-                if job.job_type == JOB_TYPE_WATCH:
-                    cache_key = (job.user_id, job.course_code)
-                    if cache_key not in cycle_cache:
-                        cycle_cache[cache_key] = await self.fetch_course(job)
-                    course_data = cycle_cache[cache_key]
-                    sections = compact_sections(filter_sections(course_data, job.section_filters))
-                    snapshot_key = f"job:{job.id}:watch"
-                    previous = self.storage.get_snapshot(snapshot_key)
-                    changes = diff_sections(previous, sections)
-                    self.storage.set_snapshot(snapshot_key, sections)
-                    if previous is not None and has_changes(changes):
-                        user = self._user_for_job(job)
-                        if user:
-                            await self.send_message(user.telegram_id, format_changes(job.course_code, changes))
-                            sent += 1
-                    self.storage.record_job_success(job.id, action="watch", message="watch cycle completed")
-                else:
-                    sent += await self._process_automation_job(job)
+                sent += await self._process_automation_job(job)
             except Exception as exc:  # keep one bad user/job from stopping the cycle
                 message = f"job {job.id}: {exc}"
-                logging.exception("watch scheduler failed for %s", message)
+                logging.exception("automation scheduler failed for %s", message)
                 errors.append(message)
                 self._record_backoff(job, str(exc))
 

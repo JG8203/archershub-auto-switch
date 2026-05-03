@@ -162,24 +162,26 @@ poetry run archershub-admin list-pending
 poetry run archershub-admin set-interval 30
 ```
 
-### User commands
+### User flow and commands
 
-- `/start <one-time-code>` registers a Telegram user.
-- `/connect` starts credential setup and verifies ArchersHub login. Credentials and cookies are stored encrypted with `ARCHERSHUB_MASTER_KEY`; sensitive Telegram messages are deleted when the bot has permission.
-- `/watch COURSE [SECTION ...]` watches all sections of a course or selected section names.
-- `/change COURSE TARGET_SECTION [notify|confirm|auto]` stores a future change-section automation job.
-- `/addclass COURSE[:SEC1,SEC2] [COURSE2[:SEC1,SEC2] ...] [notify|confirm|auto]` stores one or more add-class automation jobs; fallback uses section-name order and never displaces current classes by default.
-- `/setmode JOB_ID notify|confirm|auto` edits an existing job mode.
-- `/setpriorities JOB_ID SEC1 [SEC2 ...]` edits add-class priorities.
-- `/retarget JOB_ID SECTION` edits a change-section target.
-- `/pause JOB_ID` pauses a job without removing it.
-- `/resume JOB_ID` resumes a paused job.
-- `/checknow [JOB_ID]` runs an immediate manual check.
-- `/summary` shows job counts, pending confirmations, failing jobs, and captcha state.
-- `/confirm JOB_ID` executes a pending confirmation request after rechecking availability.
-- `/reject JOB_ID` clears a pending confirmation request without disabling the job.
-- `/jobs` lists jobs.
-- `/remove JOB_ID` disables a job.
+After `/start <one-time-code>` and `/connect`, the bot shows a guided menu:
+
+- **Add a class**: for a course you are not enlisted in yet. The bot tries priority sections first, then safe fallback sections. It never drops or changes existing classes to resolve conflicts.
+- **Change section**: for a course you already have. The bot uses ArchersHub's change-section function only, never drop-add.
+
+Power-user commands remain available:
+
+- `/addclass LCFAITH:Z18,Z19` creates an add-class automation job.
+- `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting.
+- `/change LCFAITH Z18` creates a change-section automation job.
+- `/jobs` lists add/change jobs.
+- `/remove 12` disables job `#12`.
+- `/setmode 12 confirm` changes a job to `notify`, `confirm`, or `auto`.
+- `/setpriorities 12 Z18 Z19` edits add-class priorities.
+- `/retarget 13 Z20` edits a change-section target.
+- `/confirm 12` executes a pending confirmation request after rechecking availability.
+- `/reject 12` clears a pending confirmation request without disabling the job.
+- `/cancel` cancels setup or a guided flow.
 
 Mode behavior:
 
@@ -192,6 +194,7 @@ Change-section jobs use the existing change-section flow. Add-class jobs use the
 Captcha behavior:
 
 - Bot logins use automated OCR only; they do not fall back to terminal prompts.
+- Each automated login attempt loads a fresh login page and fresh captcha image.
 - If automated captcha solving fails 5 times in a row, the bot sends the latest captcha image to the Telegram user.
 
 Scheduler behavior:

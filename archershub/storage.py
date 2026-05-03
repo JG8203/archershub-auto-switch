@@ -227,6 +227,10 @@ class SQLiteStorage:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
             if "paused_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
+            conn.execute(
+                "UPDATE jobs SET enabled = 0, updated_at = ? WHERE job_type = ? AND enabled = 1",
+                (dt_to_text(utcnow()), JOB_TYPE_WATCH),
+            )
             now = dt_to_text(utcnow())
             conn.execute(
                 "INSERT OR IGNORE INTO scheduler_state(key, value, updated_at) VALUES('interval_secs', ?, ?)",

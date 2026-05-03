@@ -43,9 +43,9 @@ class StorageCryptoTests(unittest.TestCase):
             self.assertEqual(box.decrypt_text(creds.username_encrypted), "student")
             self.assertEqual(box.decrypt_text(creds.password_encrypted), "password")
 
-            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="lcfaith", section_filters=["C01"])
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_NOTIFY, course_code="lcfaith", priority_sections=["C01"])
             self.assertEqual(job.course_code, "LCFAITH")
-            self.assertEqual(storage.list_jobs(user_id=user.id)[0].section_filters, ["C01"])
+            self.assertEqual(storage.list_jobs(user_id=user.id)[0].priority_sections, ["C01"])
             storage.set_pending_action(job_id=job.id, user_id=user.id, action_type="add_class", target_section="C02", details={"dedupe_key": "add:2"})
             pending = storage.get_pending_action(job.id)
             self.assertEqual(pending.target_section, "C02")
@@ -140,7 +140,7 @@ class JobPlanningTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_scheduler_batches_by_user_course_and_notifies_after_initial_snapshot(self):
+    def test_scheduler_ignores_legacy_watch_jobs(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
@@ -159,13 +159,9 @@ class SchedulerTests(unittest.TestCase):
 
                 scheduler = WatchScheduler(storage, fetch, send)
                 first = await scheduler.run_once()
-                self.assertEqual(first.checked_jobs, 1)
+                self.assertEqual(first.checked_jobs, 0)
                 self.assertEqual(sent, [])
-                data[0] = dict(data[0], enlisted=10)
-                second = await scheduler.run_once()
-                self.assertEqual(second.notifications_sent, 1)
-                self.assertEqual(sent[0][0], 999)
-                self.assertLessEqual(len(calls), 2)
+                self.assertEqual(calls, [])
 
         asyncio.run(scenario())
 
