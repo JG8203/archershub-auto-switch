@@ -52,11 +52,23 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "armaine@${{ secrets.PI_HOST }}" <<'EOF'
           set -euo pipefail
+          echo "[deploy] connected to $(hostname)"
+          echo "[deploy] entering repository"
           cd /home/armaine/archershub-auto-switch
+          echo "[deploy] fetching latest main"
           git fetch origin main
+          echo "[deploy] resetting worktree to origin/main"
           git reset --hard origin/main
+          echo "[deploy] current commit: $(git rev-parse --short HEAD)"
+          echo "[deploy] installing runtime dependencies with Poetry"
           poetry install --only main --no-interaction
+          echo "[deploy] restarting archershub-bot service"
           sudo -n systemctl restart archershub-bot
+          echo "[deploy] waiting for service to settle"
           sleep 3
+          echo "[deploy] checking service health"
           sudo -n systemctl is-active --quiet archershub-bot
+          echo "[deploy] service is active"
+          echo "[deploy] recent service logs"
+          sudo -n journalctl -u archershub-bot -n 20 --no-pager
           EOF
