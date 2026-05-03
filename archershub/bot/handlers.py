@@ -317,11 +317,16 @@ class TelegramControlPanel:
         if not user:
             await self._reply_access_required(update)
             return ConversationHandler.END
-        target = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("add_course_code", ""))
-        if target is None:
-            return ConversationHandler.END
         text = update.effective_message.text.strip()
         priorities = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
+        target = await self._resolve_course_or_reply(
+            update,
+            user.id,
+            ctx.user_data.get("add_course_code", ""),
+            intent={"job_type": JOB_TYPE_ADD_CLASS, "mode": JOB_MODE_AUTO, "priority_sections": priorities}
+        )
+        if target is None:
+            return ConversationHandler.END
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_ADD_CLASS,
@@ -362,17 +367,22 @@ class TelegramControlPanel:
         if not user:
             await self._reply_access_required(update)
             return ConversationHandler.END
-        target_course = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("change_course_code", ""))
+        target_section = normalize_section_name(update.effective_message.text.strip())
+        target_course = await self._resolve_course_or_reply(
+            update,
+            user.id,
+            ctx.user_data.get("change_course_code", ""),
+            intent={"job_type": JOB_TYPE_CHANGE_SECTION, "mode": JOB_MODE_AUTO, "target_section": target_section}
+        )
         if target_course is None:
             return ConversationHandler.END
-        target = normalize_section_name(update.effective_message.text.strip())
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_CHANGE_SECTION,
             mode=JOB_MODE_AUTO,
             course_code=target_course["course_code"],
             course_creation_id=target_course["course_creation_id"],
-            target_section=target,
+            target_section=target_section,
         )
         ctx.user_data.clear()
         await update.effective_message.reply_text(self._change_job_confirmation(job), reply_markup=self.main_menu_markup())
@@ -393,10 +403,16 @@ class TelegramControlPanel:
                 "Use this only for a class you already have. It uses ArchersHub change-section, never drop-add."
             )
             return
-        target_course = await self._resolve_course_or_reply(update, user.id, ctx.args[0])
+        mode = self._mode_from_args(ctx.args[2:])
+        target_section = normalize_section_name(ctx.args[1])
+        target_course = await self._resolve_course_or_reply(
+            update,
+            user.id,
+            ctx.args[0],
+            intent={"job_type": JOB_TYPE_CHANGE_SECTION, "mode": mode, "target_section": target_section}
+        )
         if target_course is None:
             return
-        mode = self._mode_from_args(ctx.args[2:])
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_CHANGE_SECTION,
@@ -431,7 +447,12 @@ class TelegramControlPanel:
             return
         jobs = []
         for course_code, priorities in specs:
-            target_course = await self._resolve_course_or_reply(update, user.id, course_code)
+            target_course = await self._resolve_course_or_reply(
+                update,
+                user.id,
+                course_code,
+                intent={"job_type": JOB_TYPE_ADD_CLASS, "mode": mode, "priority_sections": priorities}
+            )
             if target_course is None:
                 return
             jobs.append(
@@ -462,10 +483,15 @@ class TelegramControlPanel:
                 "This only notifies you when matching sections have available slots. It never submits changes."
             )
             return
-        target_course = await self._resolve_course_or_reply(update, user.id, ctx.args[0])
+        sections = [normalize_section_name(arg) for arg in ctx.args[1:]]
+        target_course = await self._resolve_course_or_reply(
+            update,
+            user.id,
+            ctx.args[0],
+            intent={"job_type": JOB_TYPE_WATCH, "mode": JOB_MODE_NOTIFY, "section_filters": sections}
+        )
         if target_course is None:
             return
-        sections = [normalize_section_name(arg) for arg in ctx.args[1:]]
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_WATCH,
@@ -511,11 +537,16 @@ class TelegramControlPanel:
         if not user:
             await self._reply_access_required(update)
             return ConversationHandler.END
-        target_course = await self._resolve_course_or_reply(update, user.id, ctx.user_data.get("watch_course_code", ""))
-        if target_course is None:
-            return ConversationHandler.END
         text = update.effective_message.text.strip()
         sections = [] if text in {"-", "skip", "SKIP"} else [normalize_section_name(part) for part in text.replace(",", " ").split()]
+        target_course = await self._resolve_course_or_reply(
+            update,
+            user.id,
+            ctx.user_data.get("watch_course_code", ""),
+            intent={"job_type": JOB_TYPE_WATCH, "mode": JOB_MODE_NOTIFY, "section_filters": sections}
+        )
+        if target_course is None:
+            return ConversationHandler.END
         job = self.storage.add_job(
             user_id=user.id,
             job_type=JOB_TYPE_WATCH,
@@ -662,6 +693,7 @@ class TelegramControlPanel:
         course = courses[course_index]
         course_code = str(course.get("course_code") or "").upper()
         course_creation_id = str(course.get("course_creation_id") or "")
+        intent = state.get("intent")
         section = None
         if section_index is not None:
             section = self._section_at(state, course_index, section_index)
@@ -678,8 +710,39 @@ class TelegramControlPanel:
             job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_CHANGE_SECTION, mode=JOB_MODE_AUTO, course_code=course_code, course_creation_id=course_creation_id, target_section=section["section_name"])
             await update.effective_message.reply_text(self._change_job_confirmation(job), reply_markup=self.main_menu_markup())
         elif action == "addall":
-            job = self.storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code=course_code, course_creation_id=course_creation_id, priority_sections=[])
-            await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
+            job_type = intent.get("job_type") if intent else JOB_TYPE_ADD_CLASS
+            mode = intent.get("mode") if intent else JOB_MODE_AUTO
+            # If we had specific filters in intent, maybe we should respect them?
+            # But "addall" in UI usually means "everything".
+            # However, if it was /watch COURSE Z18 and they click "Watch entire subject", 
+            # we should probably watch Z18 if intent has it.
+            # But let's stick to the simplest fix: just respect job_type and mode.
+            
+            section_filters = intent.get("section_filters") if intent and job_type == JOB_TYPE_WATCH else []
+            priority_sections = intent.get("priority_sections") if intent and job_type == JOB_TYPE_ADD_CLASS else []
+            target_section = intent.get("target_section") if intent and job_type == JOB_TYPE_CHANGE_SECTION else None
+
+            job = self.storage.add_job(
+                user_id=user.id,
+                job_type=job_type,
+                mode=mode,
+                course_code=course_code,
+                course_creation_id=course_creation_id,
+                section_filters=section_filters,
+                priority_sections=priority_sections,
+                target_section=target_section,
+            )
+            if job_type == JOB_TYPE_WATCH:
+                target = "all sections" if not section_filters else ", ".join(section_filters)
+                await update.effective_message.reply_text(
+                    f"Saved watch job #{job.id} for {job.course_code}: {target}.\n"
+                    "I will only notify when matching sections gain available slots.",
+                    reply_markup=self.main_menu_markup(),
+                )
+            elif job_type == JOB_TYPE_CHANGE_SECTION:
+                await update.effective_message.reply_text(self._change_job_confirmation(job), reply_markup=self.main_menu_markup())
+            else:
+                await update.effective_message.reply_text(self._add_job_confirmation(job), reply_markup=self.main_menu_markup())
         else:
             await update.effective_message.reply_text("That search action was invalid. Use /search to start again.")
 
@@ -712,9 +775,16 @@ class TelegramControlPanel:
         courses = state.get("courses") or []
         course = courses[course_index]
         sections = ((state.get("sections") or {}).get(str(course_index))) or []
+        intent = state.get("intent")
+        all_label = "Add entire subject"
+        if intent and intent.get("job_type") == JOB_TYPE_WATCH:
+            all_label = "Watch entire subject"
+        elif intent and intent.get("job_type") == JOB_TYPE_CHANGE_SECTION:
+            all_label = "Change entire subject"
+
         page_size = 5
         if not sections:
-            return f"No sections found for {course.get('course_code')}.", InlineKeyboardMarkup([[InlineKeyboardButton("Add entire subject", callback_data=f"cs:addall:{token}:{course_index}")]])
+            return f"No sections found for {course.get('course_code')}.", InlineKeyboardMarkup([[InlineKeyboardButton(all_label, callback_data=f"cs:addall:{token}:{course_index}")]])
         max_page = max(0, (len(sections) - 1) // page_size)
         page = max(0, min(page, max_page))
         start = page * page_size
@@ -731,7 +801,7 @@ class TelegramControlPanel:
                 f"Schedule: {section.get('schedule') or '-'}"
             )
             rows.append([InlineKeyboardButton(f"{section.get('section_name')} actions", callback_data=f"cs:s:{token}:{course_index}:{idx}")])
-        rows.append([InlineKeyboardButton("Add entire subject", callback_data=f"cs:addall:{token}:{course_index}")])
+        rows.append([InlineKeyboardButton(all_label, callback_data=f"cs:addall:{token}:{course_index}")])
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("<<", callback_data=f"cs:sp:{token}:{course_index}:{page - 1}"))
@@ -1040,7 +1110,7 @@ class TelegramControlPanel:
             return None
         return job
 
-    async def _resolve_course_or_reply(self, update: Update, user_id: int, course_code: str) -> dict[str, str] | None:
+    async def _resolve_course_or_reply(self, update: Update, user_id: int, course_code: str, intent: dict | None = None) -> dict[str, str] | None:
         course_code = (course_code or "").strip().upper()
         if not course_code:
             await update.effective_message.reply_text("Course code is required. Use 🔎 Search courses if you are unsure.")
@@ -1053,7 +1123,7 @@ class TelegramControlPanel:
         except MultipleCoursesFound as exc:
             courses = self.archershub.format_course_matches(exc.matches, exc.campus_id, exc.academic_session_id)
             token = secrets.token_hex(4)
-            self._save_search_state(user_id, {"token": token, "created_at": time.time(), "query": course_code, "courses": courses, "sections": {}})
+            self._save_search_state(user_id, {"token": token, "created_at": time.time(), "query": course_code, "courses": courses, "sections": {}, "intent": intent})
             _, markup = self._course_results_message(token, {"query": course_code, "courses": courses}, 0)
             await update.effective_message.reply_text(
                 f"{course_code} has multiple Course Finder matches. Please choose the exact offering below:",

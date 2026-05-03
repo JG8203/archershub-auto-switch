@@ -25,8 +25,8 @@ class FakeMessage:
         self.replies.append((text, reply_markup, message))
         return message
 
-    async def edit_text(self, text: str):
-        self.edits.append(text)
+    async def edit_text(self, text: str, reply_markup=None):
+        self.edits.append((text, reply_markup))
 
     async def delete(self):
         self.deleted = True
@@ -213,7 +213,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             await panel.received_password(update, ctx)
 
             self.assertTrue(update.effective_message.deleted)
-            self.assertIn("ArchersHub credentials verified", update.effective_chat.sent[0][2].edits[0])
+            self.assertIn("ArchersHub credentials verified", update.effective_chat.sent[0][2].edits[0][0])
             self.assertIn("What do you want to do next?", update.effective_chat.sent[1][0])
             markup = update.effective_chat.sent[1][1]
             labels = [button.text for row in markup.inline_keyboard for button in row]
@@ -294,6 +294,61 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             # It should show buttons
             self.assertTrue(update.effective_message.replies[0][1].inline_keyboard)
 
+    async def test_watch_wizard_ambiguous_course_preserves_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 658, "tester")
+            save_dummy_credentials(storage, user.id)
+            service = AsyncMock()
+            from archershub.sections import MultipleCoursesFound
+            from unittest.mock import MagicMock
+            service.resolve_course_for_user.side_effect = MultipleCoursesFound(
+                "DSILYTC",
+                [{"course_creation_id": "1", "text": "Choice 1"}, {"course_creation_id": "2", "text": "Choice 2"}],
+                "CAMPUS",
+                "SESSION"
+            )
+            service.format_course_matches = MagicMock(return_value=[
+                {"course_code": "DSILYTC", "course_name": "Choice 1", "course_creation_id": "1"},
+                {"course_code": "DSILYTC", "course_name": "Choice 2", "course_creation_id": "2"},
+            ])
+            service.fetch_search_course_sections.return_value = [
+                {"section_name": "V01", "available": 5, "enlisted": 40, "capacity": 45}
+            ]
+            panel = TelegramControlPanel(storage, service)
+            
+            # 1. Start watch wizard and send ambiguous course
+            ctx = SimpleNamespace(user_data={"watch_course_code": "DSILYTC"})
+            update = fake_update(user.telegram_id, "-")
+            await panel.received_watch_sections(update, ctx)
+            
+            # Should have shown multiple matches
+            self.assertIn("has multiple Course Finder matches", update.effective_message.replies[0][0])
+            markup = update.effective_message.replies[0][1]
+            token = markup.inline_keyboard[0][0].callback_data.split(":")[2]
+            
+            # 2. Pick a course (choice 0)
+            callback_update = fake_callback_update(user.telegram_id, f"cs:c:{token}:0")
+            await panel.course_search_callback(callback_update, SimpleNamespace())
+            
+            # Should show sections and "Watch entire subject" button
+            # 1st reply: Loading...
+            self.assertEqual(callback_update.effective_message.replies[0][0], "Loading sections and revealing teachers when available...")
+            # 2nd reply: The section list
+            final_text, final_markup, _ = callback_update.effective_message.replies[1]
+            self.assertIn("DSILYTC sections", final_text)
+            all_btn = next(btn for row in final_markup.inline_keyboard for btn in row if "entire subject" in btn.text)
+            self.assertEqual(all_btn.text, "Watch entire subject")
+            
+            # 3. Click "Watch entire subject"
+            addall_update = fake_callback_update(user.telegram_id, all_btn.callback_data)
+            await panel.course_search_callback(addall_update, SimpleNamespace())
+            
+            # 4. Verify job type is watch
+            job = storage.list_jobs(user_id=user.id)[0]
+            self.assertEqual(job.job_type, "watch")
+            self.assertIn("Saved watch job", addall_update.effective_message.replies[0][0])
+
     async def test_watch_wizard_creates_notification_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
@@ -356,7 +411,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
 
             scheduler.run_selected.assert_awaited_once_with(user_id=user.id, job_ids={job.id})
             self.assertIn("Rechecking now", update.effective_message.replies[0][0])
-            self.assertIn("checked=1", update.effective_message.replies[0][2].edits[0])
+            self.assertIn("checked=1", update.effective_message.replies[0][2].edits[0][0])
 
 
 if __name__ == "__main__":
@@ -393,7 +448,7 @@ class TelegramCourseSearchTests(unittest.IsolatedAsyncioTestCase):
             await panel.search(update, SimpleNamespace(args=["abc"]))
 
             service.search_courses_for_user.assert_awaited_once_with(user.id, "abc")
-            self.assertIn("Search complete", update.effective_message.replies[0][2].edits[0])
+            self.assertIn("Search complete", update.effective_message.replies[0][2].edits[0][0])
             text, markup, _ = update.effective_message.replies[1]
             self.assertIn("Results 1-5 of 7", text)
             labels = [button.text for row in markup.inline_keyboard for button in row]
