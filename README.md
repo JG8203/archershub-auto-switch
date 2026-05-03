@@ -181,11 +181,13 @@ After `/start`, the bot asks for a one-time registration code, then prompts the 
 - **Add a class**: for a course you are not enlisted in yet. The bot tries priority sections first, then safe fallback sections. It never drops or changes existing classes to resolve conflicts.
 - **Change section**: for a course you already have. The bot uses ArchersHub's change-section function only, never drop-add.
 - **Watch only**: notification-only monitoring when matching sections gain available slots. It never submits changes.
+- **Search courses**: search Course Finder from Telegram, browse paginated course/section results, reveal teachers from schedule data when available, then create watch/add/change jobs from selected results. The onboarding menu shows this search button together with the direct add/change/watch action buttons.
 
 Power-user commands remain available:
 
 - `/watch LCFAITH` notifies when any section of a course gains available slots.
 - `/watch LCFAITH Z18 Z19` notifies only when listed sections gain available slots.
+- `/search LCFAITH` searches Course Finder and lets you choose a course/section action from paginated buttons.
 - `/login` connects or replaces your saved ArchersHub login.
 - `/addclass LCFAITH:Z18,Z19` creates an add-class automation job.
 - `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting; pending add-class confirmations are submitted together as one add/drop batch.

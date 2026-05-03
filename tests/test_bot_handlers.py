@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -76,12 +77,14 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("checknow", commands)
             self.assertIn("cancel", commands)
             self.assertIn("recheck", commands)
+            self.assertIn("search", commands)
             text = panel.help_text()
             self.assertIn("Add class never drops/changes", text)
             self.assertIn("change-section feature, never drop-add", text)
             self.assertIn("/recheck", text)
             self.assertIn("/watch", text)
             self.assertIn("/login", text)
+            self.assertIn("/search", text)
 
     async def test_login_command_uses_connect_flow_for_relogin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +170,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             markup = update.effective_message.replies[0][1]
             labels = [button.text for row in markup.inline_keyboard for button in row]
             self.assertIn("👀 Watch only", labels)
+            self.assertIn("🔎 Search courses", labels)
 
     async def test_revoked_user_gets_access_revoked_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,7 +204,12 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(update.effective_message.deleted)
             self.assertIn("ArchersHub credentials verified", update.effective_chat.sent[0][2].edits[0])
             self.assertIn("What do you want to do next?", update.effective_chat.sent[1][0])
-            self.assertIsNotNone(update.effective_chat.sent[1][1])
+            markup = update.effective_chat.sent[1][1]
+            labels = [button.text for row in markup.inline_keyboard for button in row]
+            self.assertIn("🔎 Search courses", labels)
+            self.assertIn("➕ Add a class", labels)
+            self.assertIn("🔁 Change section", labels)
+            self.assertIn("👀 Watch only", labels)
 
     async def test_add_and_change_wizard_create_auto_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,3 +312,88 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FakeCallbackQuery:
+    def __init__(self, data: str) -> None:
+        self.data = data
+        self.answered = False
+
+    async def answer(self):
+        self.answered = True
+
+
+def fake_callback_update(chat_id: int, data: str):
+    update = fake_update(chat_id)
+    update.callback_query = FakeCallbackQuery(data)
+    return update
+
+
+class TelegramCourseSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_command_stores_paginated_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 700, "tester")
+            save_dummy_credentials(storage, user.id)
+            service = SimpleNamespace(search_courses_for_user=AsyncMock(return_value=[
+                {"course_code": f"ABC{i}", "course_name": f"Course {i}", "course_creation_id": str(i), "campus_id": "1", "academic_session_id": "2", "is_cross_offer": "0", "grid_type": "0"}
+                for i in range(7)
+            ]))
+            panel = TelegramControlPanel(storage, service)
+            update = fake_update(user.telegram_id)
+
+            await panel.search(update, SimpleNamespace(args=["abc"]))
+
+            service.search_courses_for_user.assert_awaited_once_with(user.id, "abc")
+            self.assertIn("Search complete", update.effective_message.replies[0][2].edits[0])
+            text, markup, _ = update.effective_message.replies[1]
+            self.assertIn("Results 1-5 of 7", text)
+            labels = [button.text for row in markup.inline_keyboard for button in row]
+            self.assertIn(">>", labels)
+
+    async def test_course_search_callback_loads_sections_and_creates_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 701, "tester")
+            save_dummy_credentials(storage, user.id)
+            service = SimpleNamespace(fetch_search_course_sections=AsyncMock(return_value=[
+                {"section_name": "Z18", "section_creation_id": "1", "batch_creation_id": "0", "capacity": 45, "enlisted": 40, "available": 5, "schedule": "MON", "teacher": "Prof X"}
+            ]))
+            panel = TelegramControlPanel(storage, service)
+            state = {
+                "token": "abcd1234",
+                "created_at": time.time(),
+                "query": "LCFAITH",
+                "courses": [{"course_code": "LCFAITH", "course_name": "Faith", "course_creation_id": "10", "campus_id": "1", "academic_session_id": "2", "is_cross_offer": "0", "grid_type": "0"}],
+                "sections": {},
+            }
+            storage.set_snapshot(panel._search_snapshot_key(user.id), state)
+
+            await panel.course_search_callback(fake_callback_update(user.telegram_id, "cs:c:abcd1234:0"), SimpleNamespace())
+            cached = storage.get_snapshot(panel._search_snapshot_key(user.id))
+            self.assertEqual(cached["sections"]["0"][0]["teacher"], "Prof X")
+
+            await panel.course_search_callback(fake_callback_update(user.telegram_id, "cs:a:abcd1234:watch:0:0"), SimpleNamespace())
+            await panel.course_search_callback(fake_callback_update(user.telegram_id, "cs:a:abcd1234:add:0:0"), SimpleNamespace())
+            await panel.course_search_callback(fake_callback_update(user.telegram_id, "cs:a:abcd1234:change:0:0"), SimpleNamespace())
+            await panel.course_search_callback(fake_callback_update(user.telegram_id, "cs:addall:abcd1234:0"), SimpleNamespace())
+
+            jobs = storage.list_jobs(user_id=user.id)
+            self.assertEqual(jobs[0].job_type, "watch")
+            self.assertEqual(jobs[0].section_filters, ["Z18"])
+            self.assertEqual(jobs[1].job_type, JOB_TYPE_ADD_CLASS)
+            self.assertEqual(jobs[1].priority_sections, ["Z18"])
+            self.assertEqual(jobs[2].job_type, JOB_TYPE_CHANGE_SECTION)
+            self.assertEqual(jobs[2].target_section, "Z18")
+            self.assertEqual(jobs[3].job_type, JOB_TYPE_ADD_CLASS)
+            self.assertEqual(jobs[3].priority_sections, [])
+
+    async def test_search_requires_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 702, "tester")
+            panel = TelegramControlPanel(storage, AsyncMock())
+            update = fake_update(user.telegram_id)
+
+            await panel.search(update, SimpleNamespace(args=["LCFAITH"]))
+
+            self.assertIn("Connect your ArchersHub account first", update.effective_message.replies[0][0])
