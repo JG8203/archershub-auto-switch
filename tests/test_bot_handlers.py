@@ -8,19 +8,21 @@ from unittest.mock import AsyncMock
 from telegram.ext import CommandHandler, ConversationHandler
 
 from archershub.bot.handlers import TelegramControlPanel
+from archershub.scheduler import SchedulerCycleResult
 from archershub.storage import JOB_MODE_AUTO, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, SQLiteStorage
 
 
 class FakeMessage:
     def __init__(self, text: str = "") -> None:
         self.text = text
-        self.replies: list[tuple[str, object | None]] = []
+        self.replies: list[tuple[str, object | None, FakeMessage]] = []
         self.edits: list[str] = []
         self.deleted = False
 
     async def reply_text(self, text: str, reply_markup=None):
-        self.replies.append((text, reply_markup))
-        return self
+        message = FakeMessage()
+        self.replies.append((text, reply_markup, message))
+        return message
 
     async def edit_text(self, text: str):
         self.edits.append(text)
@@ -67,9 +69,11 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("summary", commands)
             self.assertNotIn("checknow", commands)
             self.assertIn("cancel", commands)
+            self.assertIn("recheck", commands)
             text = panel.help_text()
             self.assertIn("Add class never drops/changes", text)
             self.assertIn("change-section feature, never drop-add", text)
+            self.assertIn("/recheck", text)
 
     async def test_successful_login_continues_to_onboarding_menu(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,6 +111,22 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(jobs[0].priority_sections, ["Z18", "Z19"])
             self.assertEqual(jobs[1].job_type, JOB_TYPE_CHANGE_SECTION)
             self.assertEqual(jobs[1].target_section, "S11")
+
+    async def test_recheck_runs_selected_user_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 789, "tester")
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code="LCFAITH")
+            scheduler = SimpleNamespace(run_selected=AsyncMock(return_value=SchedulerCycleResult(checked_jobs=1, notifications_sent=0, errors=[])))
+            panel = TelegramControlPanel(storage, AsyncMock(), scheduler)
+            update = fake_update(user.telegram_id)
+            ctx = SimpleNamespace(args=[str(job.id)])
+
+            await panel.recheck(update, ctx)
+
+            scheduler.run_selected.assert_awaited_once_with(user_id=user.id, job_ids={job.id})
+            self.assertIn("Rechecking now", update.effective_message.replies[0][0])
+            self.assertIn("checked=1", update.effective_message.replies[0][2].edits[0])
 
 
 if __name__ == "__main__":

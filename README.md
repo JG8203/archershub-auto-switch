@@ -175,6 +175,8 @@ Power-user commands remain available:
 - `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting.
 - `/change LCFAITH Z18` creates a change-section automation job.
 - `/jobs` lists add/change jobs.
+- `/recheck` force-checks all active jobs immediately.
+- `/recheck 12` force-checks only job `#12` immediately.
 - `/remove 12` disables job `#12`.
 - `/setmode 12 confirm` changes a job to `notify`, `confirm`, or `auto`.
 - `/setpriorities 12 Z18 Z19` edits add-class priorities.

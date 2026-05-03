@@ -63,6 +63,7 @@ class TelegramControlPanel:
             CommandHandler("confirm", self.confirm_job),
             CommandHandler("reject", self.reject_job),
             CommandHandler("jobs", self.jobs),
+            CommandHandler("recheck", self.recheck),
             CommandHandler("remove", self.remove),
             CommandHandler("cancel", self.cancel),
             CallbackQueryHandler(self.menu_callback, pattern="^menu:(jobs|help)$"),
@@ -134,6 +135,8 @@ class TelegramControlPanel:
             "• Change section only uses ArchersHub's change-section feature, never drop-add.\n\n"
             "Manage jobs:\n"
             "• /jobs — list saved jobs.\n"
+            "• /recheck — force-check all active jobs now.\n"
+            "• /recheck 12 — force-check only job #12 now.\n"
             "• /remove 12 — disable job #12.\n"
             "• /setmode 12 confirm — change mode to notify, confirm, or auto.\n"
             "• /setpriorities 12 Z18 Z19 — edit add-class priority sections.\n"
@@ -387,6 +390,31 @@ class TelegramControlPanel:
             else:
                 lines.append(f"#{job.id} change {job.course_code} target={job.target_section} mode={job.mode} {status}")
         await update.effective_message.reply_text("\n".join(lines), reply_markup=self.main_menu_markup())
+
+    async def recheck(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start <code>.")
+            return
+        if self.scheduler is None:
+            await update.effective_message.reply_text("Recheck is unavailable because the background scheduler is not running.")
+            return
+        job_ids = None
+        if ctx.args:
+            if len(ctx.args) > 1 or not ctx.args[0].isdigit():
+                await update.effective_message.reply_text("Usage: /recheck [JOB_ID]\nExample: /recheck\nExample: /recheck 12")
+                return
+            job = self.storage.get_job(int(ctx.args[0]))
+            if job is None or job.user_id != user.id or job.job_type not in {JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
+                await update.effective_message.reply_text("That add/change job was not found.")
+                return
+            job_ids = {job.id}
+        status = await update.effective_message.reply_text("Rechecking now. I will relogin automatically if the saved session expired.")
+        result = await self.scheduler.run_selected(user_id=user.id, job_ids=job_ids)
+        message = f"Recheck complete. checked={result.checked_jobs} notifications={result.notifications_sent}"
+        if result.errors:
+            message += f" errors={len(result.errors)}"
+        await status.edit_text(message)
 
     async def confirm_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = self._registered(update)
