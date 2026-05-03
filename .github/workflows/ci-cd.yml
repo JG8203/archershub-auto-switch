@@ -61,6 +61,7 @@ jobs:
           git reset --hard origin/main
           echo "[deploy] current commit: $(git rev-parse --short HEAD)"
           echo "[deploy] installing runtime dependencies with Poetry"
+          export PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring
           poetry install --only main --no-interaction
           echo "[deploy] restarting archershub-bot service"
           sudo -n systemctl restart archershub-bot
