@@ -3,8 +3,9 @@ import tempfile
 import unittest
 
 from archershub.bot.parsing import parse_addclass_specs
+from archershub.bot.service import BotArchersHubService
 from archershub.crypto import SecretBox
-from archershub.jobs import AutomationCandidate, choose_add_class_section, plan_change_section
+from archershub.jobs import AutomationCandidate, PermanentJobError, choose_add_class_section, plan_change_section
 from archershub.notifications import compact_sections, diff_sections, filter_sections, has_changes
 from archershub.scheduler import WatchScheduler
 from archershub.storage import (
@@ -12,6 +13,7 @@ from archershub.storage import (
     JOB_MODE_CONFIRM,
     JOB_MODE_NOTIFY,
     JOB_TYPE_ADD_CLASS,
+    JOB_TYPE_CHANGE_SECTION,
     JOB_TYPE_WATCH,
     SQLiteStorage,
 )
@@ -138,14 +140,68 @@ class JobPlanningTests(unittest.TestCase):
         self.assertEqual(payload["UNIT"], "9")
         self.assertEqual(payload["CourseSelectionList"][0]["SECTION_CREATION_ID"], "900")
 
+    def test_add_class_already_enlisted_with_priority_converts_to_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 123)
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code="LCFAITH", priority_sections=["C02"])
+            service = BotArchersHubService(storage, SecretBox.from_secret("dev-secret"))
+            target = {"course_code": "LCFAITH", "course_creation_id": "123", "academic_session_id": "1", "campus_id": "1"}
+            add_state = {"bind_section": [{"course_creation_id": "123", "section_creation_id": "1"}]}
+
+            from unittest.mock import patch
+
+            with patch.object(service, "_load_course_bundle", return_value=(object(), target, COURSE_DATA)), patch("archershub.bot.service.get_add_drop_state", return_value=add_state):
+                candidate = service._inspect_automation_job_sync(job)
+
+            self.assertEqual(candidate.action, "converted_to_change")
+            updated = storage.get_job(job.id)
+            self.assertEqual(updated.job_type, JOB_TYPE_CHANGE_SECTION)
+            self.assertEqual(updated.target_section, "C02")
+
+    def test_add_class_not_add_eligible_warns_without_disabling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 123)
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code="LCFAITH", priority_sections=["C02"])
+            service = BotArchersHubService(storage, SecretBox.from_secret("dev-secret"))
+            target = {"course_code": "LCFAITH", "course_creation_id": "123", "academic_session_id": "1", "campus_id": "1"}
+            add_state = {"bind_section": [], "add_offer_course_list": []}
+
+            from unittest.mock import patch
+
+            with patch.object(service, "_load_course_bundle", return_value=(object(), target, COURSE_DATA)), patch("archershub.bot.service.get_add_drop_state", return_value=add_state):
+                candidate = service._inspect_automation_job_sync(job)
+
+            self.assertEqual(candidate.action, "add_not_eligible")
+            self.assertTrue(candidate.details["warning_only"])
+            self.assertTrue(storage.get_job(job.id).enabled)
+
+    def test_change_section_not_eligible_warns_without_disabling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 123)
+            job = storage.add_job(user_id=user.id, job_type=JOB_TYPE_CHANGE_SECTION, mode=JOB_MODE_AUTO, course_code="LCFAITH", target_section="C02")
+            service = BotArchersHubService(storage, SecretBox.from_secret("dev-secret"))
+            target = {"course_code": "LCFAITH", "course_creation_id": "123", "academic_session_id": "1", "campus_id": "1"}
+
+            from unittest.mock import patch
+
+            with patch.object(service, "_load_course_bundle", return_value=(object(), target, COURSE_DATA)), patch("archershub.bot.service.get_change_section_state", return_value={"bind_section": []}):
+                candidate = service._inspect_automation_job_sync(job)
+
+            self.assertEqual(candidate.action, "change_not_eligible")
+            self.assertTrue(candidate.details["warning_only"])
+            self.assertTrue(storage.get_job(job.id).enabled)
+
 
 class SchedulerTests(unittest.TestCase):
-    def test_scheduler_ignores_legacy_watch_jobs(self):
+    def test_scheduler_watch_jobs_notify_when_slots_open(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
                 user = storage.redeem_registration_code(storage.generate_registration_code(), 999)
-                storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="ABC")
+                storage.add_job(user_id=user.id, job_type=JOB_TYPE_WATCH, mode=JOB_MODE_NOTIFY, course_code="ABC", section_filters=["C01"])
                 sent = []
                 calls = []
                 data = [dict(row) for row in COURSE_DATA]
@@ -159,9 +215,14 @@ class SchedulerTests(unittest.TestCase):
 
                 scheduler = WatchScheduler(storage, fetch, send)
                 first = await scheduler.run_once()
-                self.assertEqual(first.checked_jobs, 0)
+                self.assertEqual(first.checked_jobs, 1)
                 self.assertEqual(sent, [])
-                self.assertEqual(calls, [])
+                data[1] = dict(data[1], enlisted=9)
+                second = await scheduler.run_once()
+                self.assertEqual(second.notifications_sent, 1)
+                self.assertEqual(sent[0][0], 999)
+                self.assertIn("C01", sent[0][1])
+                self.assertEqual(calls, [1, 1])
 
         asyncio.run(scenario())
 
@@ -265,6 +326,46 @@ class SchedulerTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_scheduler_warning_only_candidates_are_sent_once_and_not_executed(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+                user = storage.redeem_registration_code(storage.generate_registration_code(), 224)
+                storage.add_job(user_id=user.id, job_type=JOB_TYPE_ADD_CLASS, mode=JOB_MODE_AUTO, course_code="ABC")
+                sent = []
+                executed = []
+
+                async def fetch(_job):
+                    return COURSE_DATA
+
+                async def send(chat_id, text):
+                    sent.append((chat_id, text))
+
+                async def inspect(_job):
+                    return AutomationCandidate(
+                        job_type=JOB_TYPE_ADD_CLASS,
+                        course_code="ABC",
+                        action="add_not_eligible",
+                        reason="ABC is not add-eligible yet",
+                        target_section_name=None,
+                        dedupe_key="warn:add:1",
+                        details={"warning_only": True},
+                    )
+
+                async def execute(job):
+                    executed.append(job.id)
+                    return "should not run"
+
+                scheduler = WatchScheduler(storage, fetch, send, inspect_automation=inspect, execute_automation=execute)
+                first = await scheduler.run_once()
+                second = await scheduler.run_once()
+                self.assertEqual(first.notifications_sent, 1)
+                self.assertEqual(second.notifications_sent, 0)
+                self.assertEqual(executed, [])
+                self.assertIn("not add-eligible", sent[0][1])
+
+        asyncio.run(scenario())
+
     def test_scheduler_backoff_skips_immediate_retry_after_failure(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
@@ -297,6 +398,39 @@ class SchedulerTests(unittest.TestCase):
                 self.assertEqual(runtime.failure_count, 1)
                 self.assertIsNotNone(runtime.next_retry_at)
                 self.assertEqual(calls, [job.id])
+
+        asyncio.run(scenario())
+
+    def test_scheduler_stops_permanent_job_errors_and_notifies_user(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+                user = storage.redeem_registration_code(storage.generate_registration_code(), 444)
+                job = storage.add_job(
+                    user_id=user.id,
+                    job_type=JOB_TYPE_ADD_CLASS,
+                    mode=JOB_MODE_AUTO,
+                    course_code="LCFAITH",
+                )
+                sent = []
+
+                async def fetch(_job):
+                    return COURSE_DATA
+
+                async def send(chat_id, text):
+                    sent.append((chat_id, text))
+
+                async def inspect(_job):
+                    raise PermanentJobError("LCFAITH is not add-eligible")
+
+                scheduler = WatchScheduler(storage, fetch, send, inspect_automation=inspect)
+                result = await scheduler.run_once()
+                self.assertEqual(result.checked_jobs, 1)
+                self.assertEqual(result.notifications_sent, 1)
+                self.assertIn("not add-eligible", sent[0][1])
+                self.assertIsNotNone(storage.get_job(job.id).completed_at)
+                runtime = storage.get_job_runtime(job.id)
+                self.assertEqual(runtime.failure_count, 0)
 
         asyncio.run(scenario())
 

@@ -58,6 +58,11 @@ def selected_course_target(session, args: argparse.Namespace) -> dict[str, str]:
     )
 
 
+def verbose_log(args: argparse.Namespace, message: str) -> None:
+    if getattr(args, "verbose", False):
+        log(f"verbose: {message}")
+
+
 def run_course_watch(args: argparse.Namespace, password: str) -> None:
     session = authenticated_session(args, password)
     target = selected_course_target(session, args)
@@ -72,9 +77,11 @@ def run_course_watch(args: argparse.Namespace, password: str) -> None:
     previous_snapshot: str | None = None
     while True:
         try:
+            verbose_log(args, "fetching course snapshot")
             snapshot = fetch_course_snapshot(session, args.base_url, target)
         except Exception as exc:
             log(f"poll failed: {exc}; re-authenticating")
+            verbose_log(args, "session may be expired; logging in again")
             session = authenticated_session(args, password)
             target = selected_course_target(session, args)
             continue
@@ -111,6 +118,7 @@ def run_auto_switch_section(args: argparse.Namespace, password: str) -> None:
 
     while True:
         try:
+            verbose_log(args, "fetching latest course data")
             course_data = fetch_course_data(session, args.base_url, target)
             section = find_target_section(course_data, args.target_section)
             if section is None:
@@ -126,6 +134,7 @@ def run_auto_switch_section(args: argparse.Namespace, password: str) -> None:
 
             if is_section_open(section):
                 log("target section appears open; rechecking before submit")
+                verbose_log(args, "target appears open; re-fetching before mutation")
                 course_data = fetch_course_data(session, args.base_url, target)
                 section = find_target_section(course_data, args.target_section)
                 if section is None:
@@ -165,6 +174,7 @@ def run_auto_switch_section(args: argparse.Namespace, password: str) -> None:
             if args.once:
                 raise
             log("re-authenticating before continuing")
+            verbose_log(args, "session may be expired; logging in again")
             session = authenticated_session(args, password)
             target = selected_course_target(session, args)
 
@@ -205,6 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-login-attempts", type=int, default=DEFAULT_MAX_LOGIN_ATTEMPTS)
     parser.add_argument("--snapshot-file")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Print extra CLI flow logs.")
     return parser.parse_args()
 
 

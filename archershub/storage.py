@@ -227,10 +227,6 @@ class SQLiteStorage:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
             if "paused_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
-            conn.execute(
-                "UPDATE jobs SET enabled = 0, updated_at = ? WHERE job_type = ? AND enabled = 1",
-                (dt_to_text(utcnow()), JOB_TYPE_WATCH),
-            )
             now = dt_to_text(utcnow())
             conn.execute(
                 "INSERT OR IGNORE INTO scheduler_state(key, value, updated_at) VALUES('interval_secs', ?, ?)",
@@ -397,6 +393,17 @@ class SQLiteStorage:
             conn.execute(
                 "UPDATE jobs SET target_section = ?, updated_at = ? WHERE id = ?",
                 (target_section.upper() if target_section else None, dt_to_text(utcnow()), job_id),
+            )
+
+    def convert_job_to_change_section(self, job_id: int, target_section: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET job_type = ?, target_section = ?, priority_sections_json = '[]', updated_at = ?
+                WHERE id = ?
+                """,
+                (JOB_TYPE_CHANGE_SECTION, target_section.upper(), dt_to_text(utcnow()), job_id),
             )
 
     def get_snapshot(self, key: str) -> Any | None:

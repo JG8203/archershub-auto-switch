@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Awaitable, Callable
 
-from .jobs import AutomationCandidate
-from .storage import JOB_MODE_AUTO, JOB_MODE_CONFIRM, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JobRecord, SQLiteStorage, dt_to_text, text_to_dt, utcnow
+from .jobs import AutomationCandidate, PermanentJobError
+from .notifications import compact_sections, filter_sections, format_section_line
+from .storage import JOB_MODE_AUTO, JOB_MODE_CONFIRM, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, JobRecord, SQLiteStorage, dt_to_text, text_to_dt, utcnow
 
 FetchCourse = Callable[[JobRecord], Awaitable[Any]]
 SendMessage = Callable[[int, str], Awaitable[None]]
@@ -23,7 +24,7 @@ class SchedulerCycleResult:
 
 
 class WatchScheduler:
-    """Global checker that processes add-class and change-section automation jobs."""
+    """Global checker that processes watch, add-class, and change-section jobs."""
 
     def __init__(
         self,
@@ -68,14 +69,28 @@ class WatchScheduler:
         errors: list[str] = []
 
         for job in jobs:
-            if job.job_type not in {JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
+            if job.job_type not in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
                 continue
             if not ignore_backoff and self._is_backing_off(job):
                 continue
             checked += 1
             try:
                 self.storage.record_job_checked(job.id)
-                sent += await self._process_automation_job(job)
+                if job.job_type == JOB_TYPE_WATCH:
+                    sent += await self._process_watch_job(job)
+                else:
+                    sent += await self._process_automation_job(job)
+            except PermanentJobError as exc:
+                message = f"job {job.id}: {exc}"
+                logging.info("automation job stopped: %s", message)
+                errors.append(message)
+                self.storage.record_job_success(job.id, action="stopped", message=str(exc))
+                if exc.complete_job:
+                    self.storage.complete_job(job.id)
+                user = self._user_for_job(job)
+                if user:
+                    await self.send_message(user.telegram_id, f"Job #{job.id} stopped.\n\n{exc}")
+                    sent += 1
             except Exception as exc:  # keep one bad user/job from stopping the cycle
                 message = f"job {job.id}: {exc}"
                 logging.exception("automation scheduler failed for %s", message)
@@ -90,6 +105,43 @@ class WatchScheduler:
                 return user
         return None
 
+    async def _process_watch_job(self, job: JobRecord) -> int:
+        course_data = await self.fetch_course(job)
+        sections = compact_sections(filter_sections(course_data, job.section_filters))
+        snapshot_key = f"job:{job.id}:watch"
+        previous = self.storage.get_snapshot(snapshot_key)
+        self.storage.set_snapshot(snapshot_key, sections)
+        if previous is None:
+            self.storage.record_job_success(job.id, action="watch", message="initial watch snapshot recorded")
+            return 0
+
+        openings = self._watch_openings(previous, sections)
+        if not openings:
+            self.storage.record_job_success(job.id, action="watch", message="watch cycle completed")
+            return 0
+        user = self._user_for_job(job)
+        if user is None:
+            return 0
+        lines = [f"Available slots found for {job.course_code}:"]
+        lines.extend(format_section_line(row) for row in openings)
+        await self.send_message(user.telegram_id, "\n\n".join(lines))
+        self.storage.record_job_success(job.id, action="watch", message=f"notified {len(openings)} openings")
+        return 1
+
+    @staticmethod
+    def _watch_openings(previous: list[dict[str, Any]], current: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        old_by_key = {str(row.get("key")): row for row in previous}
+        openings: list[dict[str, Any]] = []
+        for row in current:
+            available = float(row.get("available") or 0)
+            if available <= 0:
+                continue
+            old = old_by_key.get(str(row.get("key")))
+            old_available = float(old.get("available") or 0) if old else 0
+            if old is None or old_available <= 0 < available or available > old_available:
+                openings.append(row)
+        return openings
+
     async def _process_automation_job(self, job: JobRecord) -> int:
         if self.inspect_automation is None:
             return 0
@@ -101,6 +153,15 @@ class WatchScheduler:
         user = self._user_for_job(job)
         if user is None:
             return 0
+
+        if candidate.details.get("warning_only"):
+            previous_alert = self.storage.get_snapshot(alert_snapshot_key)
+            if previous_alert == candidate.dedupe_key:
+                return 0
+            self.storage.set_snapshot(alert_snapshot_key, candidate.dedupe_key)
+            await self.send_message(user.telegram_id, self._format_notify_message(job, candidate))
+            self.storage.record_job_success(job.id, action=candidate.action, message=candidate.reason)
+            return 1
 
         if job.mode == JOB_MODE_AUTO:
             if self.execute_automation is None:

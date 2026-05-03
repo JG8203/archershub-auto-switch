@@ -10,6 +10,14 @@ from .sections import is_section_open, normalize_section_name
 ClashChecker = Callable[[dict[str, Any]], bool]
 
 
+class PermanentJobError(RuntimeError):
+    """A user-fixable job problem that should be reported once, not retried forever."""
+
+    def __init__(self, message: str, *, complete_job: bool = True) -> None:
+        super().__init__(message)
+        self.complete_job = complete_job
+
+
 @dataclass(frozen=True)
 class AddClassDecision:
     selected_section: dict[str, Any] | None

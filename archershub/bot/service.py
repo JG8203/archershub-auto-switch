@@ -170,12 +170,33 @@ class BotArchersHubService:
             if not job.target_section:
                 raise RuntimeError("change-section job is missing target section")
             state = get_change_section_state(session, self.base_url, target["academic_session_id"])
-            current_course = find_current_enlisted_course(state, target["course_code"], target["course_creation_id"])
+            try:
+                current_course = find_current_enlisted_course(state, target["course_code"], target["course_creation_id"])
+            except RuntimeError:
+                return self._warning_candidate(
+                    job,
+                    action="change_not_eligible",
+                    reason=(
+                        f"{job.course_code} is not change-section eligible for your account right now. "
+                        "I will keep checking and notify you if it becomes available."
+                    ),
+                    dedupe_key=f"change-not-eligible:{job.id}",
+                )
             decision = plan_change_section(
                 course_data,
                 current_section_id=str(current_course.get("section_creation_id") or ""),
                 target_section_name=job.target_section,
             )
+            if decision.target_section is None:
+                return self._warning_candidate(
+                    job,
+                    action="change_target_missing",
+                    reason=(
+                        f"Target section {job.target_section} was not found for {job.course_code}. "
+                        "I will keep checking in case it appears later."
+                    ),
+                    dedupe_key=f"change-target-missing:{job.id}:{job.target_section}",
+                )
             if not decision.should_submit or decision.target_section is None:
                 return None
             section = decision.target_section
@@ -195,6 +216,44 @@ class BotArchersHubService:
 
         if job.job_type == JOB_TYPE_ADD_CLASS:
             add_state = get_add_drop_state(session, self.base_url, target["academic_session_id"])
+            try:
+                find_current_enlisted_course(add_state, target["course_code"], target["course_creation_id"])
+            except RuntimeError:
+                pass
+            else:
+                if job.priority_sections:
+                    target_section = job.priority_sections[0]
+                    self.storage.convert_job_to_change_section(job.id, target_section)
+                    return self._warning_candidate(
+                        job,
+                        action="converted_to_change",
+                        reason=(
+                            f"You already have {job.course_code}, so I converted job #{job.id} "
+                            f"to change-section targeting {target_section}."
+                        ),
+                        dedupe_key=f"converted-to-change:{job.id}:{target_section}",
+                        target_section_name=target_section,
+                    )
+                return self._warning_candidate(
+                    job,
+                    action="already_enlisted_needs_target",
+                    reason=(
+                        f"You already have {job.course_code}. Add-class is only for classes you do not have yet. "
+                        f"Use /change {job.course_code} SECTION to choose a target section."
+                    ),
+                    dedupe_key=f"already-enlisted-no-target:{job.id}",
+                )
+            if self._find_add_course(add_state, target["course_code"], target["course_creation_id"]) is None:
+                return self._warning_candidate(
+                    job,
+                    action="add_not_eligible",
+                    reason=(
+                        f"{job.course_code} is visible in Course Finder but is not add-eligible for your account right now. "
+                        "This can happen because of curriculum/campus rules, enrollment appointment timing, max units, "
+                        "or add/drop rules. I will keep checking and notify you if it becomes available."
+                    ),
+                    dedupe_key=f"add-not-eligible:{job.id}",
+                )
             campus_no = str(add_state.get("campusno") or target["campus_id"])
             decision = choose_add_class_section(
                 course_data,
@@ -278,7 +337,9 @@ class BotArchersHubService:
             if decision.selected_section is None:
                 raise RuntimeError(decision.reason)
             target_section = decision.selected_section
-            add_course = find_add_course(add_state, target["course_code"], target["course_creation_id"])
+            add_course = self._find_add_course(add_state, target["course_code"], target["course_creation_id"])
+            if add_course is None:
+                raise RuntimeError(f"{job.course_code} is not add-eligible right now")
             section_data = get_course_wise_section_data(
                 session,
                 self.base_url,
@@ -318,3 +379,31 @@ class BotArchersHubService:
             return f"Added {job.course_code} section {target_section.get('section_name')}."
 
         raise RuntimeError(f"unsupported automation job type: {job.job_type}")
+
+    @staticmethod
+    def _find_add_course(add_state: dict[str, Any], course_code: str, course_creation_id: str) -> dict[str, Any] | None:
+        try:
+            return find_add_course(add_state, course_code, course_creation_id)
+        except RuntimeError as exc:
+            if "was not found in add-eligible courses" not in str(exc):
+                raise
+            return None
+
+    @staticmethod
+    def _warning_candidate(
+        job: JobRecord,
+        *,
+        action: str,
+        reason: str,
+        dedupe_key: str,
+        target_section_name: str | None = None,
+    ) -> AutomationCandidate:
+        return AutomationCandidate(
+            job_type=job.job_type,
+            course_code=job.course_code,
+            action=action,
+            reason=reason,
+            target_section_name=target_section_name,
+            dedupe_key=dedupe_key,
+            details={"warning_only": True},
+        )

@@ -61,11 +61,11 @@ def command_names(handlers) -> set[str]:
 
 
 class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
-    def test_help_explains_add_vs_change_and_watch_is_not_registered(self):
+    def test_help_explains_add_vs_change_and_watch_is_registered(self):
         with tempfile.TemporaryDirectory() as tmp:
             panel = TelegramControlPanel(SQLiteStorage(f"{tmp}/bot.sqlite3"), AsyncMock())
             commands = command_names(panel.build_handlers())
-            self.assertNotIn("watch", commands)
+            self.assertIn("watch", commands)
             self.assertNotIn("summary", commands)
             self.assertNotIn("checknow", commands)
             self.assertIn("cancel", commands)
@@ -74,6 +74,7 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Add class never drops/changes", text)
             self.assertIn("change-section feature, never drop-add", text)
             self.assertIn("/recheck", text)
+            self.assertIn("/watch", text)
 
     async def test_successful_login_continues_to_onboarding_menu(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +112,21 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(jobs[0].priority_sections, ["Z18", "Z19"])
             self.assertEqual(jobs[1].job_type, JOB_TYPE_CHANGE_SECTION)
             self.assertEqual(jobs[1].target_section, "S11")
+
+    async def test_watch_command_creates_notification_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 654, "tester")
+            panel = TelegramControlPanel(storage, AsyncMock())
+            update = fake_update(user.telegram_id)
+            ctx = SimpleNamespace(args=["LCFAITH", "Z18", "Z19"])
+
+            await panel.watch(update, ctx)
+
+            job = storage.list_jobs(user_id=user.id)[0]
+            self.assertEqual(job.job_type, "watch")
+            self.assertEqual(job.section_filters, ["Z18", "Z19"])
+            self.assertIn("Saved watch job", update.effective_message.replies[0][0])
 
     async def test_recheck_runs_selected_user_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

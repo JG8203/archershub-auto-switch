@@ -16,7 +16,8 @@ poetry run python -m archershub \
   --password 'YOUR_PASSWORD' \
   --course-code LCFAITH \
   --target-section Z18 \
-  --auto-switch-section
+  --auto-switch-section \
+  --verbose
 ```
 
 The default auto-switch strategy is `drop-add`. The script still requires manual captcha entry at login.
@@ -171,10 +172,12 @@ After `/start <one-time-code>` and `/connect`, the bot shows a guided menu:
 
 Power-user commands remain available:
 
+- `/watch LCFAITH` notifies when any section of a course gains available slots.
+- `/watch LCFAITH Z18 Z19` notifies only when listed sections gain available slots.
 - `/addclass LCFAITH:Z18,Z19` creates an add-class automation job.
 - `/addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm` creates multiple add-class jobs and asks before submitting.
 - `/change LCFAITH Z18` creates a change-section automation job.
-- `/jobs` lists add/change jobs.
+- `/jobs` lists watch/add/change jobs.
 - `/recheck` force-checks all active jobs immediately.
 - `/recheck 12` force-checks only job `#12` immediately.
 - `/remove 12` disables job `#12`.
@@ -192,6 +195,8 @@ Mode behavior:
 - `auto` rechecks availability and submits immediately, then completes the job on success.
 
 Change-section jobs use the existing change-section flow. Add-class jobs use the add/drop add-course flow, try priority sections first, skip clashing sections, and then fall back to normalized section-name order without displacing existing classes.
+
+If an add-class job is for a course you already have, the bot converts it to a change-section job when priorities were supplied. If a course is visible in Course Finder but not currently add/change eligible in ArchersHub, the bot warns once and keeps checking.
 
 Captcha behavior:
 

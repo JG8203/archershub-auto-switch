@@ -7,7 +7,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 
 from ..scheduler import WatchScheduler
 from ..sections import normalize_section_name
-from ..storage import JOB_MODE_AUTO, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, SQLiteStorage
+from ..storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, JOB_TYPE_WATCH, SQLiteStorage
 from .messages import delete_message_safely
 from .parsing import MODE_VALUES, parse_addclass_specs
 from .service import BotArchersHubService, TelegramCaptchaRequired
@@ -55,6 +55,7 @@ class TelegramControlPanel:
                 persistent=False,
             ),
             CommandHandler("help", self.help),
+            CommandHandler("watch", self.watch),
             CommandHandler("change", self.change_section_job),
             CommandHandler("addclass", self.add_class_job),
             CommandHandler("setmode", self.set_mode),
@@ -127,6 +128,7 @@ class TelegramControlPanel:
         return (
             "ArchersHub Bot Help\n\n"
             "Create jobs:\n"
+            "• /watch LCFAITH Z18 Z19 — notify when matching sections get slots.\n"
             "• /addclass LCFAITH:Z18,Z19 — add a class you do not have yet. Priorities are optional.\n"
             "• /addclass LCFAITH:Z18,Z19 GETEAMS:S11 confirm — add multiple classes and ask before submitting.\n"
             "• /change LCFAITH Z18 — change an existing class to section Z18.\n\n"
@@ -326,6 +328,33 @@ class TelegramControlPanel:
         ]
         await update.effective_message.reply_text("\n\n".join(self._add_job_confirmation(job) for job in jobs))
 
+    async def watch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        user = self._registered(update)
+        if not user:
+            await update.effective_message.reply_text("Register first with /start <code>.")
+            return
+        if not ctx.args:
+            await update.effective_message.reply_text(
+                "Usage: /watch COURSE [SECTION ...]\n"
+                "Example: /watch LCFAITH\n"
+                "Example: /watch LCFAITH Z18 Z19\n\n"
+                "This only notifies you when matching sections have available slots. It never submits changes."
+            )
+            return
+        sections = [normalize_section_name(arg) for arg in ctx.args[1:]]
+        job = self.storage.add_job(
+            user_id=user.id,
+            job_type=JOB_TYPE_WATCH,
+            mode=JOB_MODE_NOTIFY,
+            course_code=ctx.args[0].upper(),
+            section_filters=sections,
+        )
+        target = "all sections" if not sections else ", ".join(sections)
+        await update.effective_message.reply_text(
+            f"Saved watch job #{job.id} for {job.course_code}: {target}.\n"
+            "I will only notify when matching sections gain available slots."
+        )
+
     async def set_mode(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         job = await self._owned_job_or_reply(update, ctx, usage="Usage: /setmode JOB_ID notify|confirm|auto\nExample: /setmode 12 confirm")
         if job is None:
@@ -366,11 +395,12 @@ class TelegramControlPanel:
         if not user:
             await update.effective_message.reply_text("Register first with /start <code>.")
             return
-        jobs = [job for job in self.storage.list_jobs(user_id=user.id) if job.job_type in {JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}]
+        jobs = [job for job in self.storage.list_jobs(user_id=user.id) if job.job_type in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}]
         pending_by_job = {item.job_id: item for item in self.storage.list_pending_actions(user_id=user.id)}
         if not jobs:
             await update.effective_message.reply_text(
-                "No add/change jobs yet. Choose an option below or use:\n"
+                "No jobs yet. Choose an option below or use:\n"
+                "/watch LCFAITH Z18\n"
                 "/addclass LCFAITH:Z18,Z19\n"
                 "/change LCFAITH Z18",
                 reply_markup=self.main_menu_markup(),
@@ -387,8 +417,11 @@ class TelegramControlPanel:
             if job.job_type == JOB_TYPE_ADD_CLASS:
                 priorities = ",".join(job.priority_sections) if job.priority_sections else "fallback"
                 lines.append(f"#{job.id} add {job.course_code} priorities={priorities} mode={job.mode} {status}")
-            else:
+            elif job.job_type == JOB_TYPE_CHANGE_SECTION:
                 lines.append(f"#{job.id} change {job.course_code} target={job.target_section} mode={job.mode} {status}")
+            else:
+                sections = ",".join(job.section_filters) if job.section_filters else "all"
+                lines.append(f"#{job.id} watch {job.course_code} sections={sections} {status}")
         await update.effective_message.reply_text("\n".join(lines), reply_markup=self.main_menu_markup())
 
     async def recheck(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -405,8 +438,8 @@ class TelegramControlPanel:
                 await update.effective_message.reply_text("Usage: /recheck [JOB_ID]\nExample: /recheck\nExample: /recheck 12")
                 return
             job = self.storage.get_job(int(ctx.args[0]))
-            if job is None or job.user_id != user.id or job.job_type not in {JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
-                await update.effective_message.reply_text("That add/change job was not found.")
+            if job is None or job.user_id != user.id or job.job_type not in {JOB_TYPE_WATCH, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION}:
+                await update.effective_message.reply_text("That job was not found.")
                 return
             job_ids = {job.id}
         status = await update.effective_message.reply_text("Rechecking now. I will relogin automatically if the saved session expired.")
