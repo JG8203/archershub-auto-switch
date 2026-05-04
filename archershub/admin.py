@@ -181,7 +181,7 @@ def main() -> None:
                 creds = storage.get_credentials(user.id)
                 if creds:
                     try:
-                        username = secret_box.decrypt(creds.username_encrypted)
+                        username = secret_box.decrypt_text(creds.username_encrypted)
                         if username == args.identifier:
                             user_id = user.id
                             break
@@ -197,8 +197,8 @@ def main() -> None:
             print(f"No credentials stored for user ID {user_id}")
             return
 
-        username = secret_box.decrypt(creds.username_encrypted)
-        password = secret_box.decrypt(creds.password_encrypted)
+        username = secret_box.decrypt_text(creds.username_encrypted)
+        password = secret_box.decrypt_text(creds.password_encrypted)
 
         client = ArchersHubClient(username=username, password=password)
         try:
