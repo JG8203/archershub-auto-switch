@@ -116,15 +116,22 @@ def main() -> None:
         logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
 
         secret_box = SecretBox.from_env()
+
+        async def send_captcha_mock(chat_id, image_bytes, caption):
+            print(f"CAPTCHA for {chat_id}: {caption}")
+
+        async def send_message_mock(chat_id, text):
+            print(f"TELEGRAM to {chat_id}: {text}")
+
         ah_service = BotArchersHubService(
             storage,
             secret_box,
-            send_captcha_image=lambda chat_id, image_bytes, caption: print(f"CAPTCHA for {chat_id}: {caption}"),
+            send_captcha_image=send_captcha_mock,
         )
         scheduler = WatchScheduler(
             storage,
             fetch_course=ah_service.fetch_course_for_job,
-            send_message=lambda chat_id, text: print(f"TELEGRAM to {chat_id}: {text}"),
+            send_message=send_message_mock,
             inspect_automation=ah_service.inspect_automation_job,
             execute_automation=ah_service.execute_automation_job,
             execute_automation_batch=ah_service.execute_automation_batch,
