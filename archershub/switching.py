@@ -332,8 +332,6 @@ def find_add_course(
 
     if not matches:
         raise RuntimeError(f"{course_code} was not found in add-eligible courses")
-    if len(matches) > 1:
-        raise RuntimeError(f"multiple add rows found for {course_code}; refusing to guess")
     return matches[0]
 
 
@@ -509,8 +507,6 @@ def find_current_enlisted_course(
 
     if not matches:
         raise RuntimeError(f"student is not currently enlisted in {course_code}")
-    if len(matches) > 1:
-        raise RuntimeError(f"multiple current enlisted rows found for {course_code}; refusing to guess")
     return matches[0]
 
 

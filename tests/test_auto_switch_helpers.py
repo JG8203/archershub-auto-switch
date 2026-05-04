@@ -239,6 +239,30 @@ class AutoSwitchHelperTests(unittest.TestCase):
         self.assertEqual(resolve_add_drop_reason(data, "2", reason_text="schedule"), "3")
         self.assertEqual(resolve_add_drop_reason(data, "1", reason_text="study"), "5")
 
+    def test_find_add_course_returns_first_match_on_multiple(self):
+        from archershub.switching import find_add_course
+        state = {
+            "add_course_list": [
+                {"course_code": "DSILYTC", "course_creation_id": "1", "text": "Match 1"},
+                {"course_code": "DSILYTC", "course_creation_id": "2", "text": "Match 2"},
+            ]
+        }
+        match = find_add_course(state, "DSILYTC", "non-existent")
+        self.assertEqual(match["course_creation_id"], "1")
+        self.assertEqual(match["text"], "Match 1")
+
+    def test_find_current_enlisted_course_returns_first_match_on_multiple(self):
+        from archershub.switching import find_current_enlisted_course
+        state = {
+            "bind_section": [
+                {"course_code": "DSILYTC", "course_creation_id": "1", "text": "Enlisted 1"},
+                {"course_code": "DSILYTC", "course_creation_id": "2", "text": "Enlisted 2"},
+            ]
+        }
+        match = find_current_enlisted_course(state, "DSILYTC", "non-existent")
+        self.assertEqual(match["course_creation_id"], "1")
+        self.assertEqual(match["text"], "Enlisted 1")
+
 
 if __name__ == "__main__":
     unittest.main()
