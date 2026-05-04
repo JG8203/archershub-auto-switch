@@ -43,6 +43,10 @@ def main() -> None:
     recheck.add_argument("job_ids", nargs="*", type=int, help="Optional job IDs to recheck. If empty, all active jobs are checked.")
     recheck.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
 
+    set_cid = sub.add_parser("set-cid", help="Update the course creation ID (cid) for a job.")
+    set_cid.add_argument("job_id", type=int)
+    set_cid.add_argument("cid")
+
     args = parser.parse_args()
     storage = storage_from_args(args)
 
@@ -139,6 +143,9 @@ def main() -> None:
                 print(f"ERROR: {err}")
 
         asyncio.run(run())
+    elif args.command == "set-cid":
+        storage.update_job_course_creation_id(args.job_id, args.cid)
+        print(f"Updated job #{args.job_id} cid={args.cid}")
     elif args.command == "init-db":
         print(f"initialized {storage.path}")
 
