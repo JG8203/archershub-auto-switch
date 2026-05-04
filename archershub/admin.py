@@ -161,20 +161,32 @@ def main() -> None:
         secret_box = SecretBox.from_env()
 
         user_id = None
+        # 1. Try finding by database ID
         if args.identifier.isdigit():
             user = storage.get_user(int(args.identifier))
             if user:
                 user_id = user.id
         
+        # 2. Try finding by Telegram username
         if user_id is None:
-            # Try finding by username (id number)
+            target_username = args.identifier.lstrip("@").lower()
+            for user in storage.list_users():
+                if user.username and user.username.lower() == target_username:
+                    user_id = user.id
+                    break
+
+        # 3. Try finding by decrypted ArchersHub username (ID number)
+        if user_id is None:
             for user in storage.list_users():
                 creds = storage.get_credentials(user.id)
                 if creds:
-                    username = secret_box.decrypt(creds.username_encrypted)
-                    if username == args.identifier:
-                        user_id = user.id
-                        break
+                    try:
+                        username = secret_box.decrypt(creds.username_encrypted)
+                        if username == args.identifier:
+                            user_id = user.id
+                            break
+                    except Exception:
+                        continue
         
         if user_id is None:
             print(f"User not found for identifier: {args.identifier}")
