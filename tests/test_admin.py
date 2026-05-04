@@ -98,6 +98,69 @@ class AdminCliTests(unittest.TestCase):
             self.assertIn("Section: Z18", output)
             self.assertIn("Schedule: MON 09:00-10:30", output)
 
+    def test_list_schedule_resolves_numeric_archershub_username(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "bot.sqlite3")
+            storage = SQLiteStorage(db)
+            code = storage.generate_registration_code(ttl_hours=1)
+            user = storage.redeem_registration_code(code, 123, "tester")
+            box = SecretBox.from_secret("dev-secret")
+            storage.save_credentials(user.id, box.encrypt_text("11922334"), box.encrypt_text("password"), None)
+
+            profile_enlistment = SimpleNamespace(
+                get_all_drop_down=unittest.mock.Mock(return_value=[]),
+                get_profile_enlistmentgrid_list=unittest.mock.Mock(
+                    return_value=[{"course_code": "LCFAITH", "course_name": "Faith"}]
+                ),
+            )
+            client = SimpleNamespace(login=unittest.mock.Mock(), profile_enlistment=profile_enlistment)
+
+            with patch.dict("os.environ", {"ARCHERSHUB_MASTER_KEY": "dev-secret"}), patch(
+                "archershub.client.ArchersHubClient", return_value=client
+            ):
+                output = self.run_admin("--db", db, "list-schedule", "11922334")
+
+            self.assertIn("LCFAITH - Faith", output)
+
+    def test_list_schedule_tries_other_sessions_when_current_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "bot.sqlite3")
+            storage = SQLiteStorage(db)
+            code = storage.generate_registration_code(ttl_hours=1)
+            user = storage.redeem_registration_code(code, 123, "tester")
+            box = SecretBox.from_secret("dev-secret")
+            storage.save_credentials(user.id, box.encrypt_text("11922334"), box.encrypt_text("password"), None)
+
+            profile_enlistment = SimpleNamespace()
+            profile_enlistment.get_all_drop_down = unittest.mock.Mock(
+                return_value=[
+                    {"academic_session_id": 20, "is_current_session": True},
+                    {"academic_session_id": 10, "is_current_session": False},
+                ]
+            )
+            profile_enlistment.get_profile_enlistmentgrid_list = unittest.mock.Mock(
+                side_effect=[
+                    [],
+                    {"payload": {"items": [{"COURSE_CODE": "GETEAMS", "COURSE_NAME": "Teams", "SECTION_NAME": "S11"}]}},
+                ]
+            )
+            client = SimpleNamespace(login=unittest.mock.Mock(), profile_enlistment=profile_enlistment)
+
+            with patch.dict("os.environ", {"ARCHERSHUB_MASTER_KEY": "dev-secret"}), patch(
+                "archershub.client.ArchersHubClient", return_value=client
+            ):
+                output = self.run_admin("--db", db, "list-schedule", "tester")
+
+            self.assertEqual(
+                profile_enlistment.get_profile_enlistmentgrid_list.call_args_list,
+                [
+                    unittest.mock.call(params={"academicid": "20"}),
+                    unittest.mock.call(params={"academicid": "10"}),
+                ],
+            )
+            self.assertIn("GETEAMS - Teams", output)
+            self.assertIn("Section: S11", output)
+
 
 if __name__ == "__main__":
     unittest.main()

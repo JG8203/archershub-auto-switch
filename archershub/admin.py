@@ -23,25 +23,62 @@ def _value(row: dict, *keys: str) -> str:
     return "-"
 
 
-def _current_academic_session_id(sessions) -> str | None:
+def _academic_session_ids(sessions) -> list[str | None]:
     if not isinstance(sessions, list):
-        return None
-    current = next((row for row in sessions if isinstance(row, dict) and row.get("is_current_session")), None)
-    row = current or next((row for row in sessions if isinstance(row, dict)), None)
-    if row is None:
-        return None
-    value = row.get("academic_session_id")
-    return str(value) if value not in (None, "") else None
+        return [None]
+
+    current: list[str] = []
+    other: list[str] = []
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("academic_session_id") or row.get("ACADEMIC_SESSION_ID")
+        if value in (None, "", 0, "0"):
+            continue
+        target = current if row.get("is_current_session") or row.get("IS_CURRENT_SESSION") else other
+        target.append(str(value))
+
+    ordered = current + [value for value in other if value not in current]
+    return ordered + [None]
 
 
 def _enlistment_rows(data) -> list[dict]:
+    def looks_like_course_row(row: dict) -> bool:
+        keys = set(row)
+        return bool(
+            {"course_code", "course_name", "section_name", "time_table_date"} & keys
+            or {"COURSE_CODE", "COURSE_NAME", "SECTION_NAME", "TIME_TABLE_DATE"} & keys
+        )
+
+    def walk(value) -> list[dict]:
+        if isinstance(value, list):
+            rows = [row for row in value if isinstance(row, dict)]
+            course_rows = [row for row in rows if looks_like_course_row(row)]
+            if course_rows:
+                return course_rows
+            for item in value:
+                nested = walk(item)
+                if nested:
+                    return nested
+        elif isinstance(value, dict):
+            if looks_like_course_row(value):
+                return [value]
+            for item in value.values():
+                nested = walk(item)
+                if nested:
+                    return nested
+        return []
+
     if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
+        return walk(data)
     if isinstance(data, dict):
         for key in ("data", "rows", "profile_enlistment_grid_list", "profile_enlistmentgrid_list"):
             rows = data.get(key)
             if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, dict)]
+                extracted = walk(rows)
+                if extracted:
+                    return extracted
+        return walk(data)
     return []
 
 
@@ -191,23 +228,27 @@ def main() -> None:
         secret_box = SecretBox.from_env()
 
         user_id = None
-        # 1. Try finding by database ID
+        users = storage.list_users()
+        # 1. Try finding by local database ID or Telegram ID.
         if args.identifier.isdigit():
-            user = storage.get_user(int(args.identifier))
-            if user:
+            numeric_identifier = int(args.identifier)
+            user = next((row for row in users if row.id == numeric_identifier), None)
+            if user is None:
+                user = storage.get_user_by_telegram_id(numeric_identifier)
+            if user is not None:
                 user_id = user.id
         
         # 2. Try finding by Telegram username
         if user_id is None:
             target_username = args.identifier.lstrip("@").lower()
-            for user in storage.list_users():
+            for user in users:
                 if user.username and user.username.lower() == target_username:
                     user_id = user.id
                     break
 
         # 3. Try finding by decrypted ArchersHub username (ID number)
         if user_id is None:
-            for user in storage.list_users():
+            for user in users:
                 creds = storage.get_credentials(user.id)
                 if creds:
                     try:
@@ -235,11 +276,15 @@ def main() -> None:
             print(f"Logging in as {username}...")
             client.login()
             print("Fetching enlistment schedule...")
-            academic_session_id = _current_academic_session_id(client.profile_enlistment.get_all_drop_down())
-            data = client.profile_enlistment.get_profile_enlistmentgrid_list(
-                params={"academicid": academic_session_id} if academic_session_id else {}
-            )
-            rows = _enlistment_rows(data)
+            sessions = client.profile_enlistment.get_all_drop_down()
+            rows = []
+            for academic_session_id in _academic_session_ids(sessions):
+                data = client.profile_enlistment.get_profile_enlistmentgrid_list(
+                    params={"academicid": academic_session_id} if academic_session_id else {}
+                )
+                rows = _enlistment_rows(data)
+                if rows:
+                    break
 
             if not rows:
                 print("No enrolled courses found in enlistment data.")
