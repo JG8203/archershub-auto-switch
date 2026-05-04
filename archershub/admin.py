@@ -207,7 +207,13 @@ def main() -> None:
             print("Fetching schedule...")
             data = client.schedule.get_schedule_data()
             
-            rows = data.get("bind_section") or []
+            if isinstance(data, list):
+                rows = data
+            elif isinstance(data, dict):
+                rows = data.get("bind_section") or []
+            else:
+                rows = []
+
             if not rows:
                 print("No enrolled courses found in schedule.")
                 return
