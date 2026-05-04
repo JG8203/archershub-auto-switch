@@ -15,6 +15,36 @@ def storage_from_args(args) -> SQLiteStorage:
     return SQLiteStorage(args.db or os.getenv("ARCHERSHUB_DB", "archershub_bot.sqlite3"))
 
 
+def _value(row: dict, *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "-"
+
+
+def _current_academic_session_id(sessions) -> str | None:
+    if not isinstance(sessions, list):
+        return None
+    current = next((row for row in sessions if isinstance(row, dict) and row.get("is_current_session")), None)
+    row = current or next((row for row in sessions if isinstance(row, dict)), None)
+    if row is None:
+        return None
+    value = row.get("academic_session_id")
+    return str(value) if value not in (None, "") else None
+
+
+def _enlistment_rows(data) -> list[dict]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "rows", "profile_enlistment_grid_list", "profile_enlistmentgrid_list"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
 def main() -> None:
     load_project_env()
     parser = argparse.ArgumentParser(description="Admin CLI for ArchersHub Telegram service")
@@ -204,31 +234,30 @@ def main() -> None:
         try:
             print(f"Logging in as {username}...")
             client.login()
-            print("Fetching schedule...")
-            data = client.schedule.get_schedule_data()
-            
-            if isinstance(data, list):
-                rows = data
-            elif isinstance(data, dict):
-                rows = data.get("bind_section") or []
-            else:
-                rows = []
+            print("Fetching enlistment schedule...")
+            academic_session_id = _current_academic_session_id(client.profile_enlistment.get_all_drop_down())
+            data = client.profile_enlistment.get_profile_enlistmentgrid_list(
+                params={"academicid": academic_session_id} if academic_session_id else {}
+            )
+            rows = _enlistment_rows(data)
 
             if not rows:
-                print("No enrolled courses found in schedule.")
+                print("No enrolled courses found in enlistment data.")
                 return
 
             print(f"\nSchedule for {username}:")
             print("-" * 80)
             for row in rows:
-                code = row.get("course_code") or "-"
-                name = row.get("course_name") or "-"
-                section = row.get("section_name") or "-"
-                teacher = row.get("teacher_name") or "-"
-                schedule = row.get("schedule") or "-"
+                code = _value(row, "course_code", "COURSE_CODE")
+                name = _value(row, "course_name", "COURSE_NAME")
+                section = _value(row, "section_name", "SECTION_NAME")
+                credits = _value(row, "credits", "CREDITS")
+                status = _value(row, "status", "STATUS", "approval_status", "APPROVAL_STATUS")
+                schedule = _value(row, "time_table_date", "TIME_TABLE_DATE", "schedule", "SCHEDULE")
                 print(f"{code} - {name}")
                 print(f"  Section: {section}")
-                print(f"  Teacher: {teacher}")
+                print(f"  Credits: {credits}")
+                print(f"  Status: {status}")
                 print(f"  Schedule: {schedule}")
                 print("-" * 80)
 

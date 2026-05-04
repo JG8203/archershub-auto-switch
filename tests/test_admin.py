@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from archershub.admin import main as admin_main
+from archershub.crypto import SecretBox
 from archershub.storage import SQLiteStorage
 
 
@@ -52,6 +54,49 @@ class AdminCliTests(unittest.TestCase):
 
             self.assertIn(code, output)
             self.assertIn("status=expired", output)
+
+    def test_list_schedule_uses_profile_enlistment_current_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "bot.sqlite3")
+            storage = SQLiteStorage(db)
+            code = storage.generate_registration_code(ttl_hours=1)
+            user = storage.redeem_registration_code(code, 123, "tester")
+            box = SecretBox.from_secret("dev-secret")
+            storage.save_credentials(user.id, box.encrypt_text("11922334"), box.encrypt_text("password"), None)
+
+            profile_enlistment = SimpleNamespace()
+            profile_enlistment.get_all_drop_down = unittest.mock.Mock(
+                return_value=[
+                    {"academic_session_id": 10, "is_current_session": False},
+                    {"academic_session_id": 20, "is_current_session": True},
+                ]
+            )
+            profile_enlistment.get_profile_enlistmentgrid_list = unittest.mock.Mock(
+                return_value=[
+                    {
+                        "course_code": "LCFAITH",
+                        "course_name": "Faith",
+                        "section_name": "Z18",
+                        "credits": 3,
+                        "status": "Enlisted",
+                        "time_table_date": "MON 09:00-10:30",
+                    }
+                ]
+            )
+            client = SimpleNamespace(
+                login=unittest.mock.Mock(),
+                profile_enlistment=profile_enlistment,
+            )
+
+            with patch.dict("os.environ", {"ARCHERSHUB_MASTER_KEY": "dev-secret"}), patch(
+                "archershub.client.ArchersHubClient", return_value=client
+            ):
+                output = self.run_admin("--db", db, "list-schedule", "tester")
+
+            profile_enlistment.get_profile_enlistmentgrid_list.assert_called_once_with(params={"academicid": "20"})
+            self.assertIn("LCFAITH - Faith", output)
+            self.assertIn("Section: Z18", output)
+            self.assertIn("Schedule: MON 09:00-10:30", output)
 
 
 if __name__ == "__main__":
