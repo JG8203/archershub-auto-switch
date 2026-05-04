@@ -47,6 +47,9 @@ def main() -> None:
     set_cid.add_argument("job_id", type=int)
     set_cid.add_argument("cid")
 
+    schedule = sub.add_parser("list-schedule", help="Fetch and display the current schedule for a user.")
+    schedule.add_argument("identifier", help="User ID or ArchersHub username/id number.")
+
     args = parser.parse_args()
     storage = storage_from_args(args)
 
@@ -153,6 +156,67 @@ def main() -> None:
     elif args.command == "set-cid":
         storage.update_job_course_creation_id(args.job_id, args.cid)
         print(f"Updated job #{args.job_id} cid={args.cid}")
+    elif args.command == "list-schedule":
+        from .client import ArchersHubClient
+        secret_box = SecretBox.from_env()
+
+        user_id = None
+        if args.identifier.isdigit():
+            user = storage.get_user(int(args.identifier))
+            if user:
+                user_id = user.id
+        
+        if user_id is None:
+            # Try finding by username (id number)
+            for user in storage.list_users():
+                creds = storage.get_credentials(user.id)
+                if creds:
+                    username = secret_box.decrypt(creds.username_encrypted)
+                    if username == args.identifier:
+                        user_id = user.id
+                        break
+        
+        if user_id is None:
+            print(f"User not found for identifier: {args.identifier}")
+            return
+
+        creds = storage.get_credentials(user_id)
+        if not creds:
+            print(f"No credentials stored for user ID {user_id}")
+            return
+
+        username = secret_box.decrypt(creds.username_encrypted)
+        password = secret_box.decrypt(creds.password_encrypted)
+
+        client = ArchersHubClient(username=username, password=password)
+        try:
+            print(f"Logging in as {username}...")
+            client.login()
+            print("Fetching schedule...")
+            data = client.schedule.get_schedule_data()
+            
+            rows = data.get("bind_section") or []
+            if not rows:
+                print("No enrolled courses found in schedule.")
+                return
+
+            print(f"\nSchedule for {username}:")
+            print("-" * 80)
+            for row in rows:
+                code = row.get("course_code") or "-"
+                name = row.get("course_name") or "-"
+                section = row.get("section_name") or "-"
+                teacher = row.get("teacher_name") or "-"
+                schedule = row.get("schedule") or "-"
+                print(f"{code} - {name}")
+                print(f"  Section: {section}")
+                print(f"  Teacher: {teacher}")
+                print(f"  Schedule: {schedule}")
+                print("-" * 80)
+
+        except Exception as exc:
+            print(f"Failed to fetch schedule: {exc}")
+
     elif args.command == "init-db":
         print(f"initialized {storage.path}")
 

@@ -173,6 +173,7 @@ poetry run archershub-admin set-interval 30
 poetry run archershub-admin recheck
 poetry run archershub-admin recheck 12 13 --verbose
 poetry run archershub-admin set-cid 8 12345
+poetry run archershub-admin list-schedule 11922334
 ```
 
 Revoking an unused registration code prevents future redemption while preserving an audit row. Revoking a used code also sets the matched user inactive, which blocks bot access and scheduler actions without deleting credentials, jobs, or history.
