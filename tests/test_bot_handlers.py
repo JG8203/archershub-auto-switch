@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 from telegram.ext import CommandHandler, ConversationHandler
 
-from archershub.bot.handlers import TelegramControlPanel
+from archershub.bot.handlers import ConversationState, TelegramControlPanel
 from archershub.scheduler import SchedulerCycleResult
 from archershub.storage import JOB_MODE_AUTO, JOB_MODE_NOTIFY, JOB_TYPE_ADD_CLASS, JOB_TYPE_CHANGE_SECTION, SQLiteStorage
 
@@ -348,6 +348,36 @@ class TelegramHandlerUxTests(unittest.IsolatedAsyncioTestCase):
             job = storage.list_jobs(user_id=user.id)[0]
             self.assertEqual(job.job_type, "watch")
             self.assertIn("Saved watch job", addall_update.effective_message.replies[0][0])
+
+    async def test_search_wizard_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SQLiteStorage(f"{tmp}/bot.sqlite3")
+            user = storage.redeem_registration_code(storage.generate_registration_code(), 660, "tester")
+            save_dummy_credentials(storage, user.id)
+            service = AsyncMock()
+            service.search_courses_for_user.return_value = [
+                {"course_code": "LCFAITH", "course_name": "Faith", "course_creation_id": "1", "campus_id": "1", "academic_session_id": "1"}
+            ]
+            panel = TelegramControlPanel(storage, service)
+            
+            # 1. Send /search
+            update = fake_update(user.telegram_id, "/search")
+            ctx = SimpleNamespace(args=[], user_data={})
+            state = await panel.search(update, ctx)
+            
+            self.assertEqual(state, ConversationState.ASK_SEARCH_QUERY)
+            self.assertIn("Course Search", update.effective_message.replies[0][0])
+            
+            # 2. Send query
+            query_update = fake_update(user.telegram_id, "LCFAITH")
+            state = await panel.received_search_query(query_update, ctx)
+            
+            self.assertEqual(state, ConversationHandler.END)
+            self.assertIn("Searching Course Finder", query_update.effective_message.replies[0][0])
+            # The actual search result is edited into the status message or sent as a new reply
+            # In _run_course_search, it's a new reply
+            self.assertIn("Search complete", query_update.effective_message.replies[0][2].edits[0][0])
+            self.assertIn("LCFAITH — Faith", query_update.effective_message.replies[1][0])
 
     async def test_watch_wizard_creates_notification_job(self):
         with tempfile.TemporaryDirectory() as tmp:

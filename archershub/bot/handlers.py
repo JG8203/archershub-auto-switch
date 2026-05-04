@@ -619,7 +619,7 @@ class TelegramControlPanel:
             await status.edit_text(f"No Course Finder matches for {query!r}.")
             return
         token = secrets.token_hex(4)
-        self._save_search_state(user.id, {"token": token, "created_at": time.time(), "query": query, "courses": courses, "sections": {}})
+        self._save_search_state(user.id, {"token": token, "created_at": time.time(), "query": query, "courses": courses, "sections": {}, "intent": {}})
         await status.edit_text("Search complete.")
         text, markup = self._course_results_message(token, {"query": query, "courses": courses}, 0)
         await update.effective_message.reply_text(text, reply_markup=markup)
