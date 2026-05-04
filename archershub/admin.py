@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 
+from .bot.service import BotArchersHubService
+from .crypto import SecretBox
 from .env import load_project_env
+from .scheduler import WatchScheduler
 from .storage import SQLiteStorage, text_to_dt, utcnow
 
 
@@ -35,6 +39,7 @@ def main() -> None:
     interval = sub.add_parser("set-interval")
     interval.add_argument("seconds", type=int)
     sub.add_parser("init-db")
+    sub.add_parser("recheck", help="Force immediate recheck of all active jobs, ignoring backoff.")
 
     args = parser.parse_args()
     storage = storage_from_args(args)
@@ -98,6 +103,30 @@ def main() -> None:
     elif args.command == "set-interval":
         storage.set_interval_secs(args.seconds)
         print(f"interval_secs={storage.get_interval_secs()}")
+    elif args.command == "recheck":
+        secret_box = SecretBox.from_env()
+        ah_service = BotArchersHubService(
+            storage,
+            secret_box,
+            send_captcha_image=lambda chat_id, image_bytes, caption: print(f"CAPTCHA for {chat_id}: {caption}"),
+        )
+        scheduler = WatchScheduler(
+            storage,
+            fetch_course=ah_service.fetch_course_for_job,
+            send_message=lambda chat_id, text: print(f"TELEGRAM to {chat_id}: {text}"),
+            inspect_automation=ah_service.inspect_automation_job,
+            execute_automation=ah_service.execute_automation_job,
+            execute_automation_batch=ah_service.execute_automation_batch,
+        )
+
+        async def run():
+            print("Force rechecking all active jobs...")
+            result = await scheduler.run_selected()
+            print(f"Done. checked={result.checked_jobs} notifications={result.notifications_sent} errors={len(result.errors)}")
+            for err in result.errors:
+                print(f"ERROR: {err}")
+
+        asyncio.run(run())
     elif args.command == "init-db":
         print(f"initialized {storage.path}")
 
