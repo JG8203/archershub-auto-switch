@@ -71,6 +71,7 @@ def main() -> None:
             paused = job.paused_at or "-"
             print(
                 f"{job.id}\tuser={job.user_id}\t{job.job_type}\tmode={job.mode}\t{job.course_code}\t"
+                f"cid={job.course_creation_id or '-'}\t"
                 f"enabled={job.enabled}\tpaused={paused}\tcompleted={job.completed_at or '-'}"
             )
     elif args.command == "list-failures":
