@@ -39,7 +39,9 @@ def main() -> None:
     interval = sub.add_parser("set-interval")
     interval.add_argument("seconds", type=int)
     sub.add_parser("init-db")
-    sub.add_parser("recheck", help="Force immediate recheck of all active jobs, ignoring backoff.")
+    recheck = sub.add_parser("recheck", help="Force immediate recheck of all active jobs, ignoring backoff.")
+    recheck.add_argument("job_ids", nargs="*", type=int, help="Optional job IDs to recheck. If empty, all active jobs are checked.")
+    recheck.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
 
     args = parser.parse_args()
     storage = storage_from_args(args)
@@ -105,6 +107,10 @@ def main() -> None:
         storage.set_interval_secs(args.seconds)
         print(f"interval_secs={storage.get_interval_secs()}")
     elif args.command == "recheck":
+        import logging
+        level = logging.DEBUG if args.verbose else logging.INFO
+        logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
+
         secret_box = SecretBox.from_env()
         ah_service = BotArchersHubService(
             storage,
@@ -121,8 +127,13 @@ def main() -> None:
         )
 
         async def run():
-            print("Force rechecking all active jobs...")
-            result = await scheduler.run_selected()
+            job_ids = set(args.job_ids) if args.job_ids else None
+            if job_ids:
+                print(f"Force rechecking job(s) {', '.join(map(str, job_ids))}...")
+            else:
+                print("Force rechecking all active jobs...")
+            
+            result = await scheduler.run_selected(job_ids=job_ids)
             print(f"Done. checked={result.checked_jobs} notifications={result.notifications_sent} errors={len(result.errors)}")
             for err in result.errors:
                 print(f"ERROR: {err}")
